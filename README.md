@@ -20,7 +20,7 @@ This repository contains the core utility functions, calculation modules, and he
 - Culvert capacity calculations for inlet and outlet control conditions
 - Return period flood analysis
 
-### Geomorphologic Risk Analysis
+### Hydro-Geomorphologic Risk Analysis
 - RUSLE (Revised Universal Soil Loss Equation) erosion rate calculations
 - Stream bank erosion vulnerability modeling
 - Watershed debris flow model
