@@ -69,7 +69,7 @@ These utilities are part of the **CULVERT Tool** web application, which provides
 - 🖥️ Interactive web interface for vulnerability assessments
 - 📁 Project management and data persistence
 - 📄 Comprehensive technical report generation
-- 🔌 Integration with USGS data sources
+- 🔌 Integration with open source quality data sources
 
 **Visit the main application at:** [https://culvert-at-risk.org](https://culvert-at-risk.org)
 
