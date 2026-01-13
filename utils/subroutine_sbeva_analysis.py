@@ -477,17 +477,21 @@ def gssurgo_to_variable_rasters(base_raster_path: str, boundary_shp_path: str,
             print("No states found that intersect with the boundary polygon.")
             return []
         print(f"Found {len(state_abbr_list)} states: {state_abbr_list}")
+        
         for variable in variables_list:
             print(f"\nProcessing variable: {variable}")
             try:
                 source_raster_paths = [p for state_abbr in state_abbr_list if os.path.exists(p := os.path.join(base_raster_path, state_abbr, f"{variable}.tif"))]
                 
-                # This is the original, expected output path
+                # Define output paths - raw and processed versions
+                raw_output_path = os.path.join(output_dir, f"raw_{variable}_raster.tif")
                 output_raster_path = os.path.join(output_dir, f"{variable}_raster.tif")
 
                 if not source_raster_paths:
                     print(f"  No source rasters found for '{variable}', creating NaN raster")
-                    create_nan_raster_from_template_sbeva(template_path, output_raster_path)
+                    create_nan_raster_from_template_sbeva(template_path, raw_output_path)
+                    # Copy to non-raw version for consistency
+                    shutil.copy2(raw_output_path, output_raster_path)
                     output_paths.append(output_raster_path)
                     continue
                 
@@ -497,19 +501,19 @@ def gssurgo_to_variable_rasters(base_raster_path: str, boundary_shp_path: str,
                     gdal.BuildVRT(vrt_path, source_raster_paths)
                     input_for_processing = vrt_path
                 
-                # Process the raw data and save it to the final destination
+                # Process the raw data and save it with 'raw_' prefix
+                print(f"  Saving raw clipped data to: raw_{variable}_raster.tif")
                 process_raster_to_template_sbeva(
-                    input_for_processing, output_raster_path, template_props, dissolved_boundary_path,
+                    input_for_processing, raw_output_path, template_props, dissolved_boundary_path,
                     resampling_method=Resampling.nearest, temp_dir=local_temp_dir, input_crs_override='EPSG:5070'
                 )
-
-               
-                # For rootznaws ONLY, reopen and overwrite the file with categorized/inverted data.
+                
+                # For rootznaws ONLY, create a categorized version
                 if variable == 'rootznaws':
                     print("  Applying softmax categorization and inverting scale for 'rootznaws'...")
                     
-                    # Read the data and metadata from the file we just created
-                    with rasterio.open(output_raster_path, 'r') as src:
+                    # Read the raw data
+                    with rasterio.open(raw_output_path, 'r') as src:
                         meta = src.meta.copy()
                         data = src.read(1)
 
@@ -523,16 +527,25 @@ def gssurgo_to_variable_rasters(base_raster_path: str, boundary_shp_path: str,
                     # 3. Update metadata for the new float data
                     meta.update(dtype='float32', nodata=np.nan)
                     
-                    # 4. Overwrite the original file with the corrected data
+                    # 4. Save the categorized version (without 'raw_' prefix)
                     with rasterio.open(output_raster_path, 'w', **meta) as dst:
                         dst.write(categorized_data.astype(np.float32), 1)
                     
-                    print("  ✓ 'rootznaws' successfully categorized, inverted, and overwritten.")
+                    print(f"  ✓ Raw data saved: {raw_output_path}")
+                    print(f"  ✓ Categorized data saved: {output_raster_path}")
+                else:
+                    # For other variables (runoff, drainagecl, hydgrp), 
+                    # they are already categorical codes - just copy raw to regular output
+                    print(f"  Variable '{variable}' contains categorical codes (not categorizing)")
+                    shutil.copy2(raw_output_path, output_raster_path)
+                    print(f"  ✓ Raw data saved: {raw_output_path}")
+                    print(f"  ✓ Output data saved: {output_raster_path}")
               
-                print(f"  ✓ Success: {output_raster_path}")
+                print(f"  ✓ Success: {variable} processing complete")
                 output_paths.append(output_raster_path)
             except Exception as e:
                 print(f"  Error processing '{variable}': {str(e)}")
+        
         print(f"\n✓ GSSURGO processing complete: {len(output_paths)} rasters created")
         return output_paths
     except Exception as e:

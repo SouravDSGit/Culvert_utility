@@ -259,14 +259,28 @@ def clip_vector_data_to_polygon(vector_data_file_path,polygon_file_path,save_cli
     # load data to be clipped
     gdf = gpd.read_file(vector_data_file_path)
     # check if the pour points are grouped then find the unique pour point for ws deln
+    # check if the pour points are grouped then find the unique pour point for ws deln
     if 'Grp_ID' in gdf.columns:
-         non_na_gdf = gdf[gdf['Grp_ID'].notna()] # rows with non NA values
-         na_gdf = gdf[gdf['Grp_ID']=='NA'] # rows with NA values
-
-         gdf_unique = non_na_gdf.drop_duplicates(subset='Grp_ID',keep='first')
-         result_gdf = pd.concat([gdf_unique,na_gdf])
+        # rows with valid non-NA/None values
+        non_na_gdf = gdf[
+            (gdf['Grp_ID'].notna()) & 
+            (gdf['Grp_ID'] != 'NA') & 
+            (gdf['Grp_ID'] != 'None') &
+            (gdf['Grp_ID'] != '')
+        ]
+        
+        # rows with NA, None, NaN, or empty values
+        na_gdf = gdf[
+            (gdf['Grp_ID'].isna()) | 
+            (gdf['Grp_ID'] == 'NA') | 
+            (gdf['Grp_ID'] == 'None') |
+            (gdf['Grp_ID'] == '')
+        ]
+        
+        gdf_unique = non_na_gdf.drop_duplicates(subset='Grp_ID', keep='first')
+        result_gdf = pd.concat([gdf_unique, na_gdf])
     else:
-         result_gdf = gdf
+        result_gdf = gdf
     # Clip vector data
     clipped_gdf = gpd.clip(result_gdf, boundary_gdf)
     clipped_gdf.to_file(save_clipped_vector_file_path)
@@ -790,6 +804,325 @@ def simplify_geometry(gdf, tolerance=1.0):
         print(f"Removed {original_count - len(gdf)} empty geometries after simplification")
     
     return gdf
+#============================================================================================================================
+#Function to delineate NESTED watersheds from pour points
+#============================================================================================================================
+def nested_basin_delineation(dem_path, pour_points_path, flow_dir_path, flow_accum_path,
+                             output_dir, output_shapefile, snap_distance=30, ID_column='Point_ID',
+                             emit_progress_func=None, user_id=None, project_name=None, task_type=None,
+                             check_cancellation_func=None):
+    """
+    Delineate nested watersheds with hierarchical relationships.
+    """
+    
+    # Load pour points
+    print("  Loading pour points...")
+    pour_points = gpd.read_file(pour_points_path)
+    n_points = len(pour_points)
+    print(f"  Found {n_points} pour points")
+    
+    # Sort points by flow accumulation (upstream to downstream)
+    print("  Sorting pour points by flow accumulation...")
+    pour_points_sorted = sort_points_by_flow_accumulation(
+        pour_points, flow_accum_path, snap_distance
+    )
+    
+    # Delineate each watershed
+    print("  Delineating individual watersheds...")
+    all_watersheds = []
+    watershed_files = []
+    
+    for idx, row in pour_points_sorted.iterrows():
+        print(f"    Watershed {idx+1}/{n_points}...")
+        
+        point_id = row.get(ID_column, idx)
+        
+        # Create temporary point file
+        point_gdf = gpd.GeoDataFrame([row], crs=pour_points.crs)
+        temp_point = f"{output_dir}/temp_point_{idx}.shp"
+        point_gdf.to_file(temp_point)
+        watershed_files.append(temp_point)
+        
+        # Snap to stream
+        snapped_point = f"{output_dir}/snapped_point_{idx}.shp"
+        wbt.jenson_snap_pour_points(
+            pour_pts=temp_point,
+            streams=flow_accum_path,
+            output=snapped_point,
+            snap_dist=snap_distance
+        )
+        watershed_files.append(snapped_point)
+        
+        # Delineate watershed
+        watershed_raster = f"{output_dir}/watershed_{idx}.tif"
+        
+        wbt.watershed(
+            d8_pntr=flow_dir_path,
+            pour_pts=snapped_point,
+            output=watershed_raster
+        )
+        watershed_files.append(watershed_raster)
+        if emit_progress_func:
+            watersheds_completed = idx + 1
+            percent_complete = 87  # Progress 87%
+            emit_progress_func(user_id, project_name, task_type, percent_complete, 
+                            f"Delineated watershed {watersheds_completed}/{n_points}")
+            # Check for cancellation after reporting progress
+            if check_cancellation_func:
+                check_cancellation_func(user_id, project_name, task_type)
+        # Convert to polygon
+        watershed_vector = f"{output_dir}/watershed_{idx}.shp"
+        wbt.raster_to_vector_polygons(
+            i=watershed_raster,
+            output=watershed_vector
+        )
+        watershed_files.append(watershed_vector)
+        
+        # Load watershed polygon
+        ws_gdf = gpd.read_file(watershed_vector)
+        ws_gdf = ws_gdf[ws_gdf.geometry.area > 0]
+        
+        if len(ws_gdf) > 0:
+            ws_gdf = ws_gdf.dissolve()
+            ws_gdf[ID_column] = point_id
+            ws_gdf['watershed_id'] = idx
+            
+            all_watersheds.append(ws_gdf)
+    
+    print("  Combining all watersheds...")
+    combined_watersheds = gpd.GeoDataFrame(
+        pd.concat(all_watersheds, ignore_index=True),
+        crs=pour_points.crs
+    )
+    
+    # ✅ FIX: REPAIR GEOMETRIES BEFORE HIERARCHY ANALYSIS
+    print("  Repairing watershed geometries...")
+    combined_watersheds = repair_geometry(combined_watersheds)
+    combined_watersheds = simplify_geometry(combined_watersheds, tolerance=1.0)
+    
+    # Make sure geometries are valid after repair
+    print("  Ensuring geometry validity...")
+    combined_watersheds['geometry'] = combined_watersheds['geometry'].buffer(0)
+    
+    print("  Establishing nested hierarchy...")
+    nested_hierarchy = establish_nesting_hierarchy(combined_watersheds)
+    
+    print("  Computing incremental areas...")
+    nested_hierarchy = calculate_incremental_areas(nested_hierarchy)
+    
+    # print("  Adding flow accumulation statistics...")
+    # nested_hierarchy = add_flow_accumulation_stats(
+    #     nested_hierarchy, pour_points_sorted, flow_accum_path
+    # )
+    
+    print("  Saving merged shapefile...")
+    nested_hierarchy = nested_hierarchy.reset_index(drop=True)
+    
+    for col in ['FID', 'VALUE']:
+        if col in nested_hierarchy.columns:
+            nested_hierarchy = nested_hierarchy.drop(columns=[col])
+    
+    # Final geometry repair before saving
+    nested_hierarchy = repair_geometry(nested_hierarchy)
+    nested_hierarchy = simplify_geometry(nested_hierarchy, tolerance=1.0)
+    
+    nested_hierarchy.to_file(output_shapefile)
+    print(f"  Merged shapefile saved to: {output_shapefile}")
+    
+    print("  Cleaning up temporary files...")
+    cleanup_files(output_dir, watershed_files)
+    
+    return nested_hierarchy
+
+def sort_points_by_flow_accumulation(pour_points, flow_accum_path, buffer_dist=30):
+    """Sort pour points from upstream to downstream based on flow accumulation."""
+    with rasterio.open(flow_accum_path) as src:
+        accum_values = []
+        
+        for idx, row in pour_points.iterrows():
+            x, y = row.geometry.x, row.geometry.y
+            row_px, col_px = src.index(x, y)
+            
+            # Sample a small window to find maximum
+            window_size = int(buffer_dist / src.res[0])
+            row_start = max(0, row_px - window_size)
+            row_end = min(src.height, row_px + window_size + 1)
+            col_start = max(0, col_px - window_size)
+            col_end = min(src.width, col_px + window_size + 1)
+            
+            window_data = src.read(1, window=((row_start, row_end), (col_start, col_end)))
+            max_accum = np.max(window_data)
+            
+            accum_values.append(max_accum)
+        
+        pour_points['flow_accumulation'] = accum_values
+    
+    # Sort by flow accumulation (ascending = upstream to downstream)
+    sorted_points = pour_points.sort_values('flow_accumulation', ascending=True).reset_index(drop=True)
+    
+    return sorted_points
+
+
+def establish_nesting_hierarchy(watersheds_gdf):
+    """Determine which watersheds are nested within others."""
+    n = len(watersheds_gdf)
+    
+    # Initialize hierarchy columns
+    watersheds_gdf['parent_watershed'] = None
+    watersheds_gdf['child_count'] = 0
+    watersheds_gdf['child_ids'] = ''
+    watersheds_gdf['hierarchy_level'] = 0
+    watersheds_gdf['is_nested'] = False
+    
+    # Check each pair of watersheds
+    for i in range(n):
+        geom_i = watersheds_gdf.iloc[i].geometry
+        area_i = geom_i.area
+        
+        # Ensure geometry is valid
+        if not geom_i.is_valid:
+            geom_i = geom_i.buffer(0)
+            watersheds_gdf.at[i, 'geometry'] = geom_i
+        
+        for j in range(n):
+            if i == j:
+                continue
+                
+            geom_j = watersheds_gdf.iloc[j].geometry
+            area_j = geom_j.area
+            
+            # Ensure geometry is valid
+            if not geom_j.is_valid:
+                geom_j = geom_j.buffer(0)
+                watersheds_gdf.at[j, 'geometry'] = geom_j
+            
+            # Check if i is contained in j (i is smaller and upstream)
+            if area_i < area_j:
+                try:
+                    intersection = geom_i.intersection(geom_j)
+                    overlap_ratio = intersection.area / area_i
+                    
+                    if overlap_ratio > 0.95:  # 95% overlap = nested
+                        current_parent = watersheds_gdf.at[i, 'parent_watershed']
+                        
+                        if current_parent is None:
+                            watersheds_gdf.at[i, 'parent_watershed'] = j
+                            watersheds_gdf.at[i, 'is_nested'] = True
+                            
+                            # Add to parent's child list
+                            current_children = watersheds_gdf.at[j, 'child_ids']
+                            if current_children:
+                                watersheds_gdf.at[j, 'child_ids'] = f"{current_children},{i}"
+                            else:
+                                watersheds_gdf.at[j, 'child_ids'] = str(i)
+                            watersheds_gdf.at[j, 'child_count'] += 1
+                        else:
+                            # Check if j is smaller than current parent
+                            current_parent_area = watersheds_gdf.iloc[current_parent].geometry.area
+                            if area_j < current_parent_area:
+                                # Remove from old parent
+                                old_parent_children = watersheds_gdf.at[current_parent, 'child_ids']
+                                if old_parent_children:
+                                    old_parent_children = old_parent_children.split(',')
+                                    old_parent_children = [x for x in old_parent_children if int(x) != i]
+                                    watersheds_gdf.at[current_parent, 'child_ids'] = ','.join(old_parent_children)
+                                    watersheds_gdf.at[current_parent, 'child_count'] -= 1
+                                
+                                # Add to new parent
+                                watersheds_gdf.at[i, 'parent_watershed'] = j
+                                current_children = watersheds_gdf.at[j, 'child_ids']
+                                if current_children:
+                                    watersheds_gdf.at[j, 'child_ids'] = f"{current_children},{i}"
+                                else:
+                                    watersheds_gdf.at[j, 'child_ids'] = str(i)
+                                watersheds_gdf.at[j, 'child_count'] += 1
+                                
+                except Exception as e:
+                    # Skip this pair if geometry operation fails
+                    print(f"    Warning: Skipping containment check between watershed {i} and {j}: {e}")
+                    continue
+    
+    # Calculate hierarchy levels
+    def set_hierarchy_level(idx, level=0):
+        watersheds_gdf.at[idx, 'hierarchy_level'] = level
+        child_ids_str = watersheds_gdf.at[idx, 'child_ids']
+        if child_ids_str:
+            child_indices = [int(x) for x in child_ids_str.split(',')]
+            for child_idx in child_indices:
+                set_hierarchy_level(child_idx, level + 1)
+    
+    # Start from root watersheds
+    root_watersheds = watersheds_gdf[watersheds_gdf['parent_watershed'].isna()].index
+    for root_idx in root_watersheds:
+        set_hierarchy_level(root_idx, 0)
+    
+    return watersheds_gdf
+
+
+def calculate_incremental_areas(watersheds_gdf):
+    """Calculate incremental drainage area (area not in upstream basins)."""
+    # Calculate total area
+    watersheds_gdf['total_area_sqkm'] = watersheds_gdf.geometry.area / 1_000_000
+    
+    # Calculate incremental area
+    incremental_areas = []
+    
+    for idx, row in watersheds_gdf.iterrows():
+        total_geom = row.geometry
+        
+        # Parse child indices from string
+        child_ids_str = row['child_ids']
+        child_indices = [int(x) for x in child_ids_str.split(',')] if child_ids_str else []
+        
+        if len(child_indices) == 0:
+            incremental_geom = total_geom
+        else:
+            incremental_geom = total_geom
+            for child_idx in child_indices:
+                child_geom = watersheds_gdf.iloc[child_idx].geometry
+                incremental_geom = incremental_geom.difference(child_geom)
+        
+        incremental_area = incremental_geom.area / 1_000_000
+        incremental_areas.append(incremental_area)
+    
+    watersheds_gdf['incremental_area_sqkm'] = incremental_areas
+    watersheds_gdf['incremental_area_pct'] = (
+        watersheds_gdf['incremental_area_sqkm'] / watersheds_gdf['total_area_sqkm'] * 100
+    )
+    
+    return watersheds_gdf
+
+
+
+def add_flow_accumulation_stats(watersheds_gdf, pour_points, flow_accum_path):
+    """Add flow accumulation value at each pour point."""
+    with rasterio.open(flow_accum_path) as src:
+        flow_accum_values = []
+        
+        for idx, row in pour_points.iterrows():
+            x, y = row.geometry.x, row.geometry.y
+            row_px, col_px = src.index(x, y)
+            
+            value = src.read(1, window=((row_px, row_px+1), (col_px, col_px+1)))[0, 0]
+            flow_accum_values.append(value)
+        
+        watersheds_gdf['flow_accumulation'] = flow_accum_values
+    
+    return watersheds_gdf
+
+
+def cleanup_files(output_dir, watershed_files):
+    """Delete individual watershed shapefiles and temporary files."""
+    for file_path in watershed_files:
+        base = os.path.splitext(file_path)[0]
+        
+        for ext in ['.shp', '.shx', '.dbf', '.prj', '.cpg', '.sbn', '.sbx', '.tif']:
+            try:
+                file_to_delete = base + ext
+                if os.path.exists(file_to_delete):
+                    os.remove(file_to_delete)
+            except:
+                pass
 #============================================================================================================================
 #Function to delineate watersheds from pour points
 #============================================================================================================================
@@ -1586,7 +1919,8 @@ def flag_watersheds_with_drainage_area_outside_region_boundary(boundary_path, po
     overlapping_polygons['Outside_Area_Ha']=intersection.geometry.area/10000
     overlapping_polygons=overlapping_polygons.loc[overlapping_polygons['Outside_Area_Ha']>flag_area_ha]
     flag_ID=overlapping_polygons.loc[overlapping_polygons['Outside_Area_Ha']>flag_area_ha,pour_ID]
-    overlapping_polygons.to_file(save_flagged_polygon_path)
+    flagged_polygons=polygons_gdf[polygons_gdf[pour_ID].isin(flag_ID)]
+    flagged_polygons.to_file(save_flagged_polygon_path)
     # Sample DataFrame
     df = pd.DataFrame({
         'flag_id':flag_ID
@@ -1597,7 +1931,9 @@ def flag_watersheds_with_drainage_area_outside_region_boundary(boundary_path, po
     ws_flag_removed.to_file(save_flag_removed_polygon_path)
     pour_point_flag_removed = pour_gdf[~pour_gdf[pour_ID].isin(flag_ID)]
     pour_point_flag_removed.to_file(save_flag_removed_pour_path)
-    return overlapping_polygons, flag_ID
+    
+    
+    return flagged_polygons, flag_ID
 
 
 #=================================================================================================================================================
@@ -1745,7 +2081,7 @@ def watershed_delineation_point_both(work_directory_path,
     try:    
         My_crs = get_utm_crs_from_wgs84(user_input_boundary_file_path)
         print("Completed: UTM coordinates fetched")
-        emit_progress_func(user_id, project_name, task_type, 5, "UTM coordinates fetched")
+        emit_progress_func(user_id, project_name, task_type, 5, "UTM coordinates fetched. Projecting vectors to UTM")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -1767,7 +2103,7 @@ def watershed_delineation_point_both(work_directory_path,
         if (road_data_uploaded_by_user == 1):
             project_vector_data_to_utm(user_input_road_file_path,user_output_road_file_path)
         print("Completed: vectors projected to UTM")
-        emit_progress_func(user_id, project_name, task_type, 10, "Vectors projected to UTM")
+        emit_progress_func(user_id, project_name, task_type, 10, "Vectors projected to UTM. Projecting elevation raster to UTM")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -1787,7 +2123,7 @@ def watershed_delineation_point_both(work_directory_path,
         reproject_raster_from_path(user_input_dem_raster_file_path,
                                     dem_raster_temporary_file_path, My_crs)
         print("Completed: rasters projected to UTM")
-        emit_progress_func(user_id, project_name, task_type, 15, "Elevation raster projected to UTM")
+        emit_progress_func(user_id, project_name, task_type, 15, "Elevation raster projected to UTM, now clipping to boundary")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -1809,7 +2145,7 @@ def watershed_delineation_point_both(work_directory_path,
                                 user_output_dem_raster_file_path,
                                 offset_distance_m=150)
         print("Completed: rasters clipped to boundary with offset")
-        emit_progress_func(user_id, project_name, task_type, 20, "Elevation raster clipped to boundary")
+        emit_progress_func(user_id, project_name, task_type, 20, "Elevation raster clipped to boundary, now clipping to boundary")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -1830,7 +2166,7 @@ def watershed_delineation_point_both(work_directory_path,
                                     user_output_boundary_file_path,
                                     user_output_pour_points_file_path)
         print("Completed: vectors clipped to boundary")
-        emit_progress_func(user_id, project_name, task_type, 25, "Vectors clipped to boundary") 
+        emit_progress_func(user_id, project_name, task_type, 25, "Vectors clipped to boundary, now processing road data") 
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -1853,7 +2189,7 @@ def watershed_delineation_point_both(work_directory_path,
                 user_output_road_file_path
             )
             print("Completed: downloaded road data and road width from OpenStreetMap")
-            emit_progress_func(user_id, project_name, task_type, 30, "Downloaded road data from OpenStreetMap")
+            emit_progress_func(user_id, project_name, task_type, 30, "Downloaded road data from OpenStreetMap, now snapping pour points to roads")
         except TaskCancelledError:
             raise
         except Exception as e:
@@ -1864,7 +2200,7 @@ def watershed_delineation_point_both(work_directory_path,
                     json.dump({"error": error_message}, f)
             return folium_map, error_message
     else:
-        emit_progress_func(user_id, project_name, task_type, 30, "Using user uploaded road data")
+        emit_progress_func(user_id, project_name, task_type, 30, "Using user uploaded road data, now snapping pour points to roads")
         print("User uploaded road data. Skipping OpenStreetMap download.")
 
     
@@ -1879,7 +2215,7 @@ def watershed_delineation_point_both(work_directory_path,
                                                                 user_output_pour_points_snapped_to_roads_file_path,
                                                                 ID_column='Point_ID', snap_distance_m=20)
         print("Completed: snapped pour points to road layer")
-        emit_progress_func(user_id, project_name, task_type, 35, "Snapped pour points to road layer")
+        emit_progress_func(user_id, project_name, task_type, 35, "Snapped pour points to road layer, now creating breaklines at pour point locations")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -1903,7 +2239,7 @@ def watershed_delineation_point_both(work_directory_path,
                                                     offset=breakline_offset_m,
                                                     road_data_uploaded_by_user=road_data_uploaded_by_user)
             print("Completed: breakline segments created")
-            emit_progress_func(user_id, project_name, task_type, 40, "Breakline segments created")
+            emit_progress_func(user_id, project_name, task_type, 40, "Breakline segments created, now adjusting DEM to roads")
         except TaskCancelledError:
             raise
         except Exception as e:
@@ -1931,7 +2267,7 @@ def watershed_delineation_point_both(work_directory_path,
                                     target_crs=My_crs)
             
             print(f"Completed: evelvated dem by {road_fill_dem_by_m} m along road layer")
-            emit_progress_func(user_id, project_name, task_type, 45, f"Evelvated DEM by {road_fill_dem_by_m} m along road layer")
+            emit_progress_func(user_id, project_name, task_type, 45, f"Evelvated DEM by {road_fill_dem_by_m} m along road layer, now adjusting DEM to breaklines")
         except TaskCancelledError:
             raise
         except Exception as e:
@@ -1962,7 +2298,7 @@ def watershed_delineation_point_both(work_directory_path,
                                     target_crs=My_crs)
             
             print(f"Completed: burned dem by {breakline_burn_Dem_by_m} m along breaklines")
-            emit_progress_func(user_id, project_name, task_type, 50, f"Burned DEM by {breakline_burn_Dem_by_m} m along breaklines")
+            emit_progress_func(user_id, project_name, task_type, 50, f"Burned DEM by {breakline_burn_Dem_by_m} m along breaklines, now breaching and filling DEM")
         except TaskCancelledError:
             raise
         except Exception as e:
@@ -1974,7 +2310,7 @@ def watershed_delineation_point_both(work_directory_path,
             return folium_map, error_message
     else:
         print("User Skipped Hydro-enforcement-DEM Not Adjusted along Breaklines")
-        emit_progress_func(user_id, project_name, task_type, 50, "User skipped hydro-enforcement-DEM Not adjusted along breaklines")
+        emit_progress_func(user_id, project_name, task_type, 50, "User skipped hydro-enforcement-DEM Not adjusted along breaklines, now breaching and filling DEM")
     check_cancellation_func(user_id, project_name, task_type)
     # _______________________________________________________________________________________________
     # Step11: Breaching and Filling DEM
@@ -1985,7 +2321,7 @@ def watershed_delineation_point_both(work_directory_path,
                                 output=user_output_breached_filled_DEM_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/breached_filled_DEM_UTM.tif',
                                 max_depth=None, max_length=None, flat_increment=None,fill_pits=True)
             print("Breached and filled dem")
-            emit_progress_func(user_id, project_name, task_type, 55, "Breached and filled DEM")
+            emit_progress_func(user_id, project_name, task_type, 55, "Breached and filled DEM, now calculating flow direction,  now calculating flow direction")
         except TaskCancelledError:
             raise
         except Exception as e:
@@ -2001,7 +2337,7 @@ def watershed_delineation_point_both(work_directory_path,
                                 output=user_output_breached_filled_DEM_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/breached_filled_DEM_UTM.tif',
                                 max_depth=None, max_length=None, flat_increment=None,fill_pits=True)
             print("Breached and filled dem without hydroenforcement")
-            emit_progress_func(user_id, project_name, task_type, 55, "Breached and filled DEM without hydro-enforcement")
+            emit_progress_func(user_id, project_name, task_type, 55, "Breached and filled DEM without hydro-enforcement, now calculating flow direction")
         except TaskCancelledError:
             raise
         except Exception as e:
@@ -2020,7 +2356,7 @@ def watershed_delineation_point_both(work_directory_path,
                         output = user_output_D8flow_dir_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/Flow_dir_d8pointer_DEM_UTM.tif',
                         esri_pntr=False)
         print("Completed: calculated flow direction based on d8pointer")
-        emit_progress_func(user_id, project_name, task_type, 60, "Calculated flow direction based on d8pointer")
+        emit_progress_func(user_id, project_name, task_type, 60, "Calculated flow direction based on d8pointer, now calculating flow accumulation")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -2039,7 +2375,7 @@ def watershed_delineation_point_both(work_directory_path,
                                 output=user_output_D8Flow_accum_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/Flow_accum_d8_DEM_UTM.tif',
                                 out_type="cells",log=False,clip=False,pntr=True,esri_pntr=False)
         print("Completed: calculated flow accumulation")
-        emit_progress_func(user_id, project_name, task_type, 65, "Generted flow accumulation raster")
+        emit_progress_func(user_id, project_name, task_type, 65, "Generted flow accumulation raster, now extracting streams")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -2059,7 +2395,7 @@ def watershed_delineation_point_both(work_directory_path,
                         output=stream_raster_temporary_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/Stream_raster_d8_DEM_UTM.tif',
                         threshold=flow_accum_threshold,zero_background=False)
         print("Completed: calculated stream raster")
-        emit_progress_func(user_id, project_name, task_type, 70, "Stream raster generated")
+        emit_progress_func(user_id, project_name, task_type, 70, "Stream raster generated, now extracting stream vector")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -2078,7 +2414,7 @@ def watershed_delineation_point_both(work_directory_path,
         wbt.raster_to_vector_lines(i=stream_raster_temporary_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/Stream_raster_d8_DEM_UTM.tif',
                             output=user_output_stream_vector_file_path)#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/Stream_vector_d8_DEM_UTM.shp')
         print(f"Completed: stream vector extracted")
-        emit_progress_func(user_id, project_name, task_type, 75, "Stream vector extracted")
+        emit_progress_func(user_id, project_name, task_type, 75, "Stream vector extracted, now finding road-stream intersections")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -2100,7 +2436,7 @@ def watershed_delineation_point_both(work_directory_path,
                                     gauging_sta_pour_path=None,
                                     ID_column=pour_ID,pour_point_snap_distance_m=pour_point_snap_distance_m)
         print("Completed: Road-stream crossings identified")
-        emit_progress_func(user_id, project_name, task_type, 80, "Road-stream crossings identified")
+        emit_progress_func(user_id, project_name, task_type, 80, "Road-stream crossings identified, now snapping pour points to road-stream crossings")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -2122,7 +2458,7 @@ def watershed_delineation_point_both(work_directory_path,
                                                                                 ID_column=pour_ID, 
                                                                                 snap_distance=pour_point_snap_distance_m)
         print(f"Completed: snapped pour points to road stream crossing points within snapping distance of {pour_point_snap_distance_m}")
-        emit_progress_func(user_id, project_name, task_type, 85, f"Snapped pour points within {pour_point_snap_distance_m} m distance")
+        emit_progress_func(user_id, project_name, task_type, 85, f"Snapped pour points within {pour_point_snap_distance_m} m distance, now delineating watersheds based on pour points")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -2137,15 +2473,31 @@ def watershed_delineation_point_both(work_directory_path,
     #_________________________________________________________________________________________________
     # Step18: delineate all watersheds based on pour point
     #_________________________________________________________________________________________________
+    # try:
+    #     delineate_watersheds_for_pour_points(user_output_D8flow_dir_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/Flow_dir_d8pointer_DEM_UTM.tif',
+    #                                     user_output_pour_points_snapped_to_RSCS_file_path,#  '/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/pour_points_snapped_to_rscs_UTM.shp',
+    #                                     ws_raster_temporary_file_path,#  '/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/all_watersheds_raster_UTM.tif',
+    #                                     ws_polygon_temporary_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/all_watersheds_polygon.shp',
+    #                                     user_output_all_ws_polygon_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/all_watersheds_polygon_with_pour_ID_UTM.shp',
+    #                                     ID_column=pour_ID)
     try:
-        delineate_watersheds_for_pour_points(user_output_D8flow_dir_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/Flow_dir_d8pointer_DEM_UTM.tif',
-                                        user_output_pour_points_snapped_to_RSCS_file_path,#  '/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/pour_points_snapped_to_rscs_UTM.shp',
-                                        ws_raster_temporary_file_path,#  '/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/all_watersheds_raster_UTM.tif',
-                                        ws_polygon_temporary_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/all_watersheds_polygon.shp',
-                                        user_output_all_ws_polygon_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/all_watersheds_polygon_with_pour_ID_UTM.shp',
-                                        ID_column=pour_ID)
+        nested_basins = nested_basin_delineation(
+        dem_path=user_output_breached_filled_DEM_file_path,
+        pour_points_path=user_output_pour_points_snapped_to_RSCS_file_path,  # This exists in this function
+        flow_dir_path=user_output_D8flow_dir_file_path,
+        flow_accum_path=user_output_D8Flow_accum_file_path,
+        output_dir=user_temp_dir_path,
+        output_shapefile=user_output_all_ws_polygon_file_path,
+        snap_distance=pour_point_snap_distance_m,
+        ID_column=pour_ID,
+        emit_progress_func=emit_progress_func, 
+        user_id=user_id,                        
+        project_name=project_name,              
+        task_type=task_type,
+        check_cancellation_func=check_cancellation_func                     
+        )
         print("Completed: Watersheds delineated based on pour points")
-        emit_progress_func(user_id, project_name, task_type,87, "Watersheds delineated") 
+        emit_progress_func(user_id, project_name, task_type,91, "Watersheds delineated, now calculating average slope of watersheds") 
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -2166,7 +2518,7 @@ def watershed_delineation_point_both(work_directory_path,
                                         user_output_all_ws_polygon_file_path, 
                                         user_output_all_ws_polygon_file_path)
         print('avg slope calculated')
-        emit_progress_func(user_id, project_name, task_type,89, "Calculated avearge slope of watersheds") 
+        emit_progress_func(user_id, project_name, task_type,91, "Calculated avearge slope of watersheds, now calculating longest channel length") 
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -2188,7 +2540,7 @@ def watershed_delineation_point_both(work_directory_path,
                                     user_temp_dir_path,
                                     WS_ID='Point_ID')
         print('Longest channel length calculated')
-        emit_progress_func(user_id, project_name, task_type,92, "Longest channel length calculated")  
+        emit_progress_func(user_id, project_name, task_type,92, "Longest channel length calculated, now calculating maximum overland flow path length")  
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -2209,7 +2561,7 @@ def watershed_delineation_point_both(work_directory_path,
                                             user_output_all_ws_polygon_file_path,
                                             WS_ID='Point_ID')
         print('Maximum overland flow path length estimated')
-        emit_progress_func(user_id, project_name, task_type, 95, "Maximum overland flow path length estimated")
+        emit_progress_func(user_id, project_name, task_type, 95, "Maximum overland flow path length estimated, now calculating time of concentration")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -2229,7 +2581,7 @@ def watershed_delineation_point_both(work_directory_path,
         calculate_time_of_concentration(user_output_all_ws_polygon_file_path,
                                         user_output_all_ws_polygon_file_path)
         print('Time of concentration calculated')
-        emit_progress_func(user_id, project_name, task_type, 96, "Time of concentration calculated")
+        emit_progress_func(user_id, project_name, task_type, 96, "Time of concentration calculated, now filtering watersheds by drainage area")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -2254,7 +2606,7 @@ def watershed_delineation_point_both(work_directory_path,
                                     ID_column=pour_ID,
                                     min_area_ha=filter_Watershed_min_area_ha)
         print(f"Completed: watersheds and pour points filtered based on drianage area >={filter_Watershed_min_area_ha}")
-        emit_progress_func(user_id, project_name, task_type, 97, f"Kept watersheds with area >={filter_Watershed_min_area_ha}")
+        emit_progress_func(user_id, project_name, task_type, 97, f"Kept watersheds with area >={filter_Watershed_min_area_ha}, now flagging watersheds draining area outside AOI")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -2281,7 +2633,7 @@ def watershed_delineation_point_both(work_directory_path,
                                                                                         pour_ID=pour_ID,
                                                                                         flag_area_ha=flag_wastershed_area_outside_boundary_ha)
         print(f'Completed: Flagged watersheds with ID: {[flag_ID]} that drain all or some area > {flag_wastershed_area_outside_boundary_ha} ha outside the main region boundary')
-        emit_progress_func(user_id, project_name, task_type, 98, f'Flagged watersheds that drain area located outside the AOI')
+        emit_progress_func(user_id, project_name, task_type, 98, f'Flagged watersheds that drain area located outside the AOI, now preparing final outputs')
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -2300,7 +2652,7 @@ def watershed_delineation_point_both(work_directory_path,
         map = generate_basemap_results(work_directory_path,add_layer_control=True)
         map.save(user_output_final_watershed_html_map_path)
         print("Completed: Results saved in interactive map in html")
-        emit_progress_func(user_id, project_name, task_type, 5, "Results saved in interactive map in html")
+        emit_progress_func(user_id, project_name, task_type, 5, "Results saved in interactive map, now preparing to show final map")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -2339,8 +2691,9 @@ def watershed_delineation_point_NA(work_directory_path,
                                        stream_raster_temporary_file_path,
                                        user_output_stream_vector_file_path,
                                        user_output_road_stream_intersect_vector_file_path,
-                                       ws_raster_temporary_file_path,
-                                       ws_polygon_temporary_file_path,
+                                       user_output_Road_elevated_DEM_file_path,
+                                       user_output_breaklines_file_path,
+                                       user_output_breaklines_burned_DEM_file_path,
                                        user_output_all_ws_polygon_file_path,
                                        user_output_ws_polygon_filtered_by_area_file_path,
                                        user_output_pour_point_filtered_file_path,
@@ -2350,10 +2703,16 @@ def watershed_delineation_point_NA(work_directory_path,
                                        user_output_save_flag_removed_pour_path,
                                        user_output_final_watershed_html_map_path,
                                        pour_ID,
+                                       hydro_enforcement_select,
+                                       road_fill_dem_by_m=5, 
+                                       road_fill_Dem_buffer_m=2,
+                                       breakline_offset_m=10,
+                                       breakline_burn_Dem_by_m=10, 
+                                       breakline_burn_dem_buffer_m=1,
                                        flow_accum_threshold=100,
+                                       pour_point_snap_distance_m=20,
                                        filter_Watershed_min_area_ha = 2,
                                        flag_wastershed_area_outside_boundary_ha=0.5,
-                                       pour_point_snap_distance_m=None,
                                        road_data_uploaded_by_user=None,
                                        user_input_road_file_path=None,
                                        error_log_path=None,
@@ -2426,7 +2785,7 @@ def watershed_delineation_point_NA(work_directory_path,
     try:    
         My_crs = get_utm_crs_from_wgs84(user_input_boundary_file_path)
         print("Completed: UTM coordinates fetched")
-        emit_progress_func(user_id, project_name, task_type, 5, "UTM coordinates fetched")
+        emit_progress_func(user_id, project_name, task_type, 5, "UTM coordinates fetched,  now projecting vector data to UTM")
     except TaskCancelledError:
         raise 
     except TaskCancelledError:
@@ -2449,7 +2808,7 @@ def watershed_delineation_point_NA(work_directory_path,
         if (road_data_uploaded_by_user == 1):
             project_vector_data_to_utm(user_input_road_file_path,user_output_road_file_path)
         print("Completed: vectors projected to UTM")
-        emit_progress_func(user_id, project_name, task_type, 10, "Vectors projected to UTM")
+        emit_progress_func(user_id, project_name, task_type, 10, "Vectors projected to UTM, now projecting raster data to UTM")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -2469,7 +2828,7 @@ def watershed_delineation_point_NA(work_directory_path,
         reproject_raster_from_path(user_input_dem_raster_file_path,
                                     dem_raster_temporary_file_path, My_crs)
         print("Completed: rasters projected to UTM")
-        emit_progress_func(user_id, project_name, task_type, 15, "Elevation raster projected to UTM")
+        emit_progress_func(user_id, project_name, task_type, 15, "Elevation raster projected to UTM, now clipping to boundary")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -2491,7 +2850,7 @@ def watershed_delineation_point_NA(work_directory_path,
                                 user_output_dem_raster_file_path,
                                 offset_distance_m=150)
         print("Completed: rasters clipped to boundary with offset")
-        emit_progress_func(user_id, project_name, task_type, 20, "Elevation raster clipped to boundary")
+        emit_progress_func(user_id, project_name, task_type, 20, "Elevation raster clipped to boundary, now processing road data")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -2514,7 +2873,7 @@ def watershed_delineation_point_NA(work_directory_path,
                 user_output_road_file_path
             )
             print("Completed: downloaded road data and road width from OpenStreetMap")
-            emit_progress_func(user_id, project_name, task_type, 30, "Downloaded road data from OpenStreetMap")
+            emit_progress_func(user_id, project_name, task_type, 30, "Downloaded road data from OpenStreetMap, now processing elevation data")
         except TaskCancelledError:
             raise
         except Exception as e:
@@ -2525,7 +2884,7 @@ def watershed_delineation_point_NA(work_directory_path,
                     json.dump({"error": error_message}, f)
             return folium_map, error_message
     else:
-        emit_progress_func(user_id, project_name, task_type, 30, "Using user uploaded road data")
+        emit_progress_func(user_id, project_name, task_type, 30, "Using user uploaded road data, now processing elevation data")
         print("User uploaded road data. Skipping OpenStreetMap download.")
 
     
@@ -2539,7 +2898,7 @@ def watershed_delineation_point_NA(work_directory_path,
                             output=user_output_breached_filled_DEM_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/breached_filled_DEM_UTM.tif',
                             max_depth=None, max_length=None, flat_increment=None,fill_pits=True)
         print("Breached and filled dem")
-        emit_progress_func(user_id, project_name, task_type, 55, "Breached and filled DEM")
+        emit_progress_func(user_id, project_name, task_type, 55, "Breached and filled DEM, now calculating flow direction")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -2559,7 +2918,7 @@ def watershed_delineation_point_NA(work_directory_path,
                         output = user_output_D8flow_dir_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/Flow_dir_d8pointer_DEM_UTM.tif',
                         esri_pntr=False)
         print("Completed: calculated flow direction based on d8pointer")
-        emit_progress_func(user_id, project_name, task_type, 60, "Calculated flow direction based on d8pointer")
+        emit_progress_func(user_id, project_name, task_type, 60, "Calculated flow direction based on d8pointer, now calculating flow accumulation")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -2578,7 +2937,7 @@ def watershed_delineation_point_NA(work_directory_path,
                                 output=user_output_D8Flow_accum_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/Flow_accum_d8_DEM_UTM.tif',
                                 out_type="cells",log=False,clip=False,pntr=True,esri_pntr=False)
         print("Completed: calculated flow accumulation")
-        emit_progress_func(user_id, project_name, task_type, 65, "Generated flow accumulation raster")
+        emit_progress_func(user_id, project_name, task_type, 65, "Generated flow accumulation raster, now extracting streams")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -2598,7 +2957,7 @@ def watershed_delineation_point_NA(work_directory_path,
                         output=stream_raster_temporary_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/Stream_raster_d8_DEM_UTM.tif',
                         threshold=flow_accum_threshold,zero_background=False)
         print("Completed: calculated stream raster")
-        emit_progress_func(user_id, project_name, task_type, 70, "Stream raster generated")
+        emit_progress_func(user_id, project_name, task_type, 70, "Stream raster generated, now converting stream raster to vector")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -2617,7 +2976,7 @@ def watershed_delineation_point_NA(work_directory_path,
         wbt.raster_to_vector_lines(i=stream_raster_temporary_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/Stream_raster_d8_DEM_UTM.tif',
                             output=user_output_stream_vector_file_path)#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/Stream_vector_d8_DEM_UTM.shp')
         print(f"Completed: stream vector extracted")
-        emit_progress_func(user_id, project_name, task_type, 75, "Stream vector extracted")
+        emit_progress_func(user_id, project_name, task_type, 75, "Stream vector extracted, now finding road-stream intersections")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -2652,18 +3011,193 @@ def watershed_delineation_point_NA(work_directory_path,
     
     check_cancellation_func(user_id, project_name, task_type)
     
+    # -------------------------------------------------------------------------------------------------------------
+    # Steps to hydroenforce 
+    # --------------------------------------------------------------------------------------------------------------
+    # _______________________________________________________________________________________________
+    
+    # _______________________________________________________________________________________________
+    # Step16b: Forming breakline at pour point locations
+    # _______________________________________________________________________________________________
+    if hydro_enforcement_select=='hydroenf_required':
+        try:
+            breakline_segments_gdf = create_breaklines(user_output_road_file_path,
+                                                    user_output_road_stream_intersect_vector_file_path,
+                                                    user_output_breaklines_file_path, 
+                                                    offset=breakline_offset_m,
+                                                    road_data_uploaded_by_user=road_data_uploaded_by_user)
+            print("Completed: breakline segments created")
+            emit_progress_func(user_id, project_name, task_type, 82, "Breakline segments created, now adjusting DEM to roads and breaklines")
+        except TaskCancelledError:
+            raise
+        except Exception as e:
+            error_message=f"Error in creating breakline segments: {str(e)}"
+            print(error_message)
+            if error_log_path:
+                with open(error_log_path, 'w') as f:
+                    json.dump({"error": error_message}, f)
+            return folium_map, error_message
+    else:
+        print("Completed: breakline segments created")
+        emit_progress_func(user_id, project_name, task_type, 82, "User Skipped Hydro-enforcement-Breaklines Not Created") 
+    check_cancellation_func(user_id, project_name, task_type)
+    # _______________________________________________________________________________________________
+    # Step9: Adjusting dem to roads 
+    # _______________________________________________________________________________________________
+    if hydro_enforcement_select=='hydroenf_required':
+        try:
+            adjust_dem_along_polyline(user_output_dem_raster_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/DEM_UTM_reprojected.tif',
+                                    user_output_road_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/Roads_data_UTM.shp',
+                                    user_output_Road_elevated_DEM_file_path,#  '/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/Road_elevated_DEM_UTM_reprojected.tif', 
+                                    dy=road_fill_dem_by_m, 
+                                    burn=False,
+                                    buffer_width=road_fill_Dem_buffer_m, 
+                                    target_crs=My_crs)
+            
+            print(f"Completed: evelvated dem by {road_fill_dem_by_m} m along road layer")
+            emit_progress_func(user_id, project_name, task_type, 83, f"Evelvated DEM by {road_fill_dem_by_m} m along road layer, now adjusting DEM to breaklines")
+        except TaskCancelledError:
+            raise
+        except Exception as e:
+            error_message=f"Error in road filling dem: {str(e)}"
+            print(error_message)
+            if error_log_path:
+                with open(error_log_path, 'w') as f:
+                    json.dump({"error": error_message}, f)
+            return folium_map, error_message
+    else:
+        print("User Skipped Hydro-enforcement-DEM Not Adjusted along Road")
+        emit_progress_func(user_id, project_name, task_type, 83, "User skipped hydro-enforcement-DEM Not adjusted along road")
+    
+    check_cancellation_func(user_id, project_name, task_type)
+
+
+    # _______________________________________________________________________________________________
+    # Step10: Adjusting dem to breaklines
+    # _______________________________________________________________________________________________
+    if hydro_enforcement_select=='hydroenf_required':    
+        try:
+            adjust_dem_along_polyline(user_output_Road_elevated_DEM_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/Road_elevated_DEM_UTM_reprojected.tif',
+                                    user_output_breaklines_file_path,# '/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/breaklines_UTM.shp',
+                                    user_output_breaklines_burned_DEM_file_path,#   '/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/breaklines_burned_DEM_UTM.tif', dy=breakline_burn_Dem_by_m, burn=True,
+                                    dy=breakline_burn_Dem_by_m, 
+                                    burn=True,
+                                    buffer_width=breakline_burn_dem_buffer_m, 
+                                    target_crs=My_crs)
+            
+            print(f"Completed: burned dem by {breakline_burn_Dem_by_m} m along breaklines")
+            emit_progress_func(user_id, project_name, task_type, 84, f"Burned DEM by {breakline_burn_Dem_by_m} m along breaklines, now re-breaching and re-filling DEM")
+        except TaskCancelledError:
+            raise
+        except Exception as e:
+            error_message=f"Error in burning dem: {str(e)}"
+            print(error_message)
+            if error_log_path:
+                with open(error_log_path, 'w') as f:
+                    json.dump({"error": error_message}, f)
+            return folium_map, error_message
+    else:
+        print("User Skipped Hydro-enforcement-DEM Not Adjusted along Breaklines")
+        emit_progress_func(user_id, project_name, task_type, 84, "User skipped hydro-enforcement-DEM Not adjusted along breaklines")
+    check_cancellation_func(user_id, project_name, task_type)
+    # _______________________________________________________________________________________________
+    # Step11: Breaching and Filling DEM
+    # _______________________________________________________________________________________________
+    if hydro_enforcement_select=='hydroenf_required':
+        try:
+            wbt.breach_depressions(dem=user_output_breaklines_burned_DEM_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/breaklines_burned_DEM_UTM.tif',
+                                output=user_output_breached_filled_DEM_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/breached_filled_DEM_UTM.tif',
+                                max_depth=None, max_length=None, flat_increment=None,fill_pits=True)
+            print("Breached and filled dem")
+            emit_progress_func(user_id, project_name, task_type, 85, "Breached and filled DEM, now re-calculating flow direction")
+        except TaskCancelledError:
+            raise
+        except Exception as e:
+            error_message=f"Error in conditioning dem: {str(e)}"
+            print(error_message)
+            if error_log_path:
+                with open(error_log_path, 'w') as f:
+                    json.dump({"error": error_message}, f)
+            return folium_map, error_message
+    else:
+        print("User Skipped Hydro-enforcement-DEM Not Adjusted along Breaklines")
+        emit_progress_func(user_id, project_name, task_type, 85, "User skipped hydro-enforcement-DEM Not breached and filled")  
+    check_cancellation_func(user_id, project_name, task_type)
+    
+    # _______________________________________________________________________________________________
+    # Step12: calculating flow direction
+    # _______________________________________________________________________________________________
+    if hydro_enforcement_select=='hydroenf_required': 
+        try:
+            wbt.d8_pointer(dem = user_output_breached_filled_DEM_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/breached_filled_DEM_UTM.tif',
+                            output = user_output_D8flow_dir_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/Flow_dir_d8pointer_DEM_UTM.tif',
+                            esri_pntr=False)
+            print("Completed: calculated flow direction based on d8pointer")
+            emit_progress_func(user_id, project_name, task_type, 86, "Calculated flow direction based on d8pointer, now re-calculating flow accumulation")
+        except TaskCancelledError:
+            raise
+        except Exception as e:
+            error_message=f"Error in calculating flow direction: {str(e)}"
+            print(error_message)
+            if error_log_path:
+                with open(error_log_path, 'w') as f:
+                    json.dump({"error": error_message}, f)
+            return folium_map, error_message
+    else:
+        print("User Skipped Hydro-enforcement")
+    check_cancellation_func(user_id, project_name, task_type)
+     
+    # _______________________________________________________________________________________________
+    # Step13: calculating flow accumulation
+    # _______________________________________________________________________________________________
+    if hydro_enforcement_select=='hydroenf_required': 
+        try:
+            wbt.d8_flow_accumulation(i=user_output_D8flow_dir_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/Flow_dir_d8pointer_DEM_UTM.tif' ,
+                                    output=user_output_D8Flow_accum_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/Flow_accum_d8_DEM_UTM.tif',
+                                    out_type="cells",log=False,clip=False,pntr=True,esri_pntr=False)
+            print("Completed: calculated flow accumulation")
+            emit_progress_func(user_id, project_name, task_type, 87, "Generated flow accumulation raster, now delineating watersheds")
+        except TaskCancelledError:
+            raise
+        except Exception as e:
+            error_message=f"Error in calculating flow accumulation: {str(e)}"
+            print(error_message)
+            if error_log_path:
+                with open(error_log_path, 'w') as f:
+                    json.dump({"error": error_message}, f)
+            return folium_map, error_message
+    else:
+        print("User Skipped Hydro-enforcement")
+    check_cancellation_func(user_id, project_name, task_type)
+    
     #_________________________________________________________________________________________________
     # Step18: delineate all watersheds based on pour point
     #_________________________________________________________________________________________________
+    # try:
+    #     delineate_watersheds_for_pour_points(user_output_D8flow_dir_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/Flow_dir_d8pointer_DEM_UTM.tif',
+    #                                     user_output_road_stream_intersect_vector_file_path,#  '/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/pour_points_snapped_to_rscs_UTM.shp',
+    #                                     ws_raster_temporary_file_path,#  '/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/all_watersheds_raster_UTM.tif',
+    #                                     ws_polygon_temporary_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/all_watersheds_polygon.shp',
+    #                                     user_output_all_ws_polygon_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/all_watersheds_polygon_with_pour_ID_UTM.shp',
+    #                                     ID_column=pour_ID)
     try:
-        delineate_watersheds_for_pour_points(user_output_D8flow_dir_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/Flow_dir_d8pointer_DEM_UTM.tif',
-                                        user_output_road_stream_intersect_vector_file_path,#  '/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/pour_points_snapped_to_rscs_UTM.shp',
-                                        ws_raster_temporary_file_path,#  '/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/all_watersheds_raster_UTM.tif',
-                                        ws_polygon_temporary_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/all_watersheds_polygon.shp',
-                                        user_output_all_ws_polygon_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/all_watersheds_polygon_with_pour_ID_UTM.shp',
-                                        ID_column=pour_ID)
+        nested_basins = nested_basin_delineation(
+            dem_path=user_output_breached_filled_DEM_file_path,
+            pour_points_path=user_output_road_stream_intersect_vector_file_path,  # Different for this function
+            flow_dir_path=user_output_D8flow_dir_file_path,
+            flow_accum_path=user_output_D8Flow_accum_file_path,
+            output_dir=user_temp_dir_path,
+            output_shapefile=user_output_all_ws_polygon_file_path,
+            snap_distance=pour_point_snap_distance_m if pour_point_snap_distance_m else 30,
+            ID_column=pour_ID,
+            emit_progress_func=emit_progress_func,  
+            user_id=user_id,                       
+            project_name=project_name,              
+            task_type=task_type,
+            check_cancellation_func=check_cancellation_func                     
+        )
         print("Completed: Watersheds delineated based on pour points")
-        emit_progress_func(user_id, project_name, task_type,87, "Watersheds delineated") 
+        emit_progress_func(user_id, project_name, task_type,91, "Watersheds delineated, now calculating average slope of watersheds") 
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -2684,7 +3218,7 @@ def watershed_delineation_point_NA(work_directory_path,
                                         user_output_all_ws_polygon_file_path, 
                                         user_output_all_ws_polygon_file_path)
         print('avg slope calculated')
-        emit_progress_func(user_id, project_name, task_type,89, "Calculated avearge slope of watersheds") 
+        emit_progress_func(user_id, project_name, task_type,92, "Calculated avearge slope of watersheds, now calculating longest channel length") 
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -2706,7 +3240,7 @@ def watershed_delineation_point_NA(work_directory_path,
                                     user_temp_dir_path,
                                     WS_ID='Point_ID')
         print('Longest channel length calculated')
-        emit_progress_func(user_id, project_name, task_type,92, "Longest channel length calculated")  
+        emit_progress_func(user_id, project_name, task_type,93, "Longest channel length calculated, now calculating maximum overland flow path length")  
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -2727,7 +3261,7 @@ def watershed_delineation_point_NA(work_directory_path,
                                             user_output_all_ws_polygon_file_path,
                                             WS_ID='Point_ID')
         print('Maximum overland flow path length estimated')
-        emit_progress_func(user_id, project_name, task_type, 95, "Maximum overland flow path length estimated")
+        emit_progress_func(user_id, project_name, task_type, 95, "Maximum overland flow path length estimated, now calculating time of concentration")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -2747,7 +3281,7 @@ def watershed_delineation_point_NA(work_directory_path,
         calculate_time_of_concentration(user_output_all_ws_polygon_file_path,
                                         user_output_all_ws_polygon_file_path)
         print('Time of concentration calculated')
-        emit_progress_func(user_id, project_name, task_type, 96, "Time of concentration calculated")
+        emit_progress_func(user_id, project_name, task_type, 96, "Time of concentration calculated, now filtering watersheds by drainage area")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -2772,7 +3306,7 @@ def watershed_delineation_point_NA(work_directory_path,
                                     ID_column=pour_ID,
                                     min_area_ha=filter_Watershed_min_area_ha)
         print(f"Completed: watersheds and pour points filtered based on drianage area >={filter_Watershed_min_area_ha}")
-        emit_progress_func(user_id, project_name, task_type, 97, f"Kept watersheds with area >={filter_Watershed_min_area_ha}")
+        emit_progress_func(user_id, project_name, task_type, 97, f"Kept watersheds with area >={filter_Watershed_min_area_ha}, now flagging watersheds draining area outside AOI")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -2799,7 +3333,7 @@ def watershed_delineation_point_NA(work_directory_path,
                                                                                         pour_ID=pour_ID,
                                                                                         flag_area_ha=flag_wastershed_area_outside_boundary_ha)
         print(f'Completed: Flagged watersheds with ID: {[flag_ID]} that drain all or some area > {flag_wastershed_area_outside_boundary_ha} ha outside the main region boundary')
-        emit_progress_func(user_id, project_name, task_type, 98, f'Flagged watersheds that drain area located outside the AOI')
+        emit_progress_func(user_id, project_name, task_type, 98, f'Flagged watersheds that drain area located outside the AOI, now saving final outputs')
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -2818,7 +3352,7 @@ def watershed_delineation_point_NA(work_directory_path,
         map = generate_basemap_results(work_directory_path,add_layer_control=True)
         map.save(user_output_final_watershed_html_map_path)
         print("Completed: Results saved in interactive map in html")
-        emit_progress_func(user_id, project_name, task_type, 5, "Results saved in interactive map in html")
+        emit_progress_func(user_id, project_name, task_type, 5, "Results saved in interactive map in html, preparing to display map")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -2951,7 +3485,7 @@ def watershed_delineation_point_only_gauging_st(work_directory_path,
     try:    
         My_crs = get_utm_crs_from_wgs84(user_input_boundary_file_path)
         print("Completed: UTM coordinates fetched")
-        emit_progress_func(user_id, project_name, task_type, 5, "UTM coordinates fetched")
+        emit_progress_func(user_id, project_name, task_type, 5, "UTM coordinates fetched, now projecting vectors to UTM")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -2973,7 +3507,7 @@ def watershed_delineation_point_only_gauging_st(work_directory_path,
         if (road_data_uploaded_by_user == 1):
             project_vector_data_to_utm(user_input_road_file_path,user_output_road_file_path)
         print("Completed: vectors projected to UTM")
-        emit_progress_func(user_id, project_name, task_type, 10, "Vectors projected to UTM")
+        emit_progress_func(user_id, project_name, task_type, 10, "Vectors projected to UTM, now projecting raster to UTM")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -2993,7 +3527,7 @@ def watershed_delineation_point_only_gauging_st(work_directory_path,
         reproject_raster_from_path(user_input_dem_raster_file_path,
                                     dem_raster_temporary_file_path, My_crs)
         print("Completed: rasters projected to UTM")
-        emit_progress_func(user_id, project_name, task_type, 15, "Elevation raster projected to UTM")
+        emit_progress_func(user_id, project_name, task_type, 15, "Elevation raster projected to UTM, now clipping raster to boundary")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -3015,7 +3549,7 @@ def watershed_delineation_point_only_gauging_st(work_directory_path,
                                 user_output_dem_raster_file_path,
                                 offset_distance_m=150)
         print("Completed: rasters clipped to boundary with offset")
-        emit_progress_func(user_id, project_name, task_type, 20, "Elevation raster clipped to boundary")
+        emit_progress_func(user_id, project_name, task_type, 20, "Elevation raster clipped to boundary, now clipping culvert data to boundary")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -3037,7 +3571,7 @@ def watershed_delineation_point_only_gauging_st(work_directory_path,
                                     user_output_boundary_file_path,
                                     user_output_pour_points_file_path)
         print("Completed: vectors clipped to boundary")
-        emit_progress_func(user_id, project_name, task_type, 25, "Vectors clipped to boundary") 
+        emit_progress_func(user_id, project_name, task_type, 25, "Vectors clipped to boundary, now processing road data") 
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -3060,7 +3594,7 @@ def watershed_delineation_point_only_gauging_st(work_directory_path,
                 user_output_road_file_path
             )
             print("Completed: downloaded road data and road width from OpenStreetMap")
-            emit_progress_func(user_id, project_name, task_type, 30, "Downloaded road data from OpenStreetMap")
+            emit_progress_func(user_id, project_name, task_type, 30, "Downloaded road data from OpenStreetMap, now snapping pour points to roads")
         except TaskCancelledError:
             raise
         except Exception as e:
@@ -3071,7 +3605,7 @@ def watershed_delineation_point_only_gauging_st(work_directory_path,
                     json.dump({"error": error_message}, f)
             return folium_map, error_message
     else:
-        emit_progress_func(user_id, project_name, task_type, 30, "Using user uploaded road data")
+        emit_progress_func(user_id, project_name, task_type, 30, "Using user uploaded road data, now snapping pour points to roads")
         print("User uploaded road data. Skipping OpenStreetMap download.")
 
     
@@ -3111,7 +3645,7 @@ def watershed_delineation_point_only_gauging_st(work_directory_path,
                                                     offset=breakline_offset_m,
                                                     road_data_uploaded_by_user=road_data_uploaded_by_user)
             print("Completed: breakline segments created")
-            emit_progress_func(user_id, project_name, task_type, 40, "Breakline segments created")
+            emit_progress_func(user_id, project_name, task_type, 40, "Breakline segments created, now adjusting DEM to breaklines")
         except TaskCancelledError:
             raise
         except Exception as e:
@@ -3140,7 +3674,7 @@ def watershed_delineation_point_only_gauging_st(work_directory_path,
                                     target_crs=My_crs)
             
             print(f"Completed: burned dem by {breakline_burn_Dem_by_m} m along breaklines")
-            emit_progress_func(user_id, project_name, task_type, 50, f"Burned DEM by {breakline_burn_Dem_by_m} m along breaklines")
+            emit_progress_func(user_id, project_name, task_type, 50, f"Burned DEM by {breakline_burn_Dem_by_m} m along breaklines, now breaching and filling DEM")
         except TaskCancelledError:
             raise
         except Exception as e:
@@ -3163,7 +3697,7 @@ def watershed_delineation_point_only_gauging_st(work_directory_path,
                                 output=user_output_breached_filled_DEM_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/breached_filled_DEM_UTM.tif',
                                 max_depth=None, max_length=None, flat_increment=None,fill_pits=True)
             print("Breached and filled dem")
-            emit_progress_func(user_id, project_name, task_type, 55, "Breached and filled DEM")
+            emit_progress_func(user_id, project_name, task_type, 55, "Breached and filled DEM, now calculating flow direction")
         except TaskCancelledError:
             raise
         except Exception as e:
@@ -3198,7 +3732,7 @@ def watershed_delineation_point_only_gauging_st(work_directory_path,
                         output = user_output_D8flow_dir_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/Flow_dir_d8pointer_DEM_UTM.tif',
                         esri_pntr=False)
         print("Completed: calculated flow direction based on d8pointer")
-        emit_progress_func(user_id, project_name, task_type, 60, "Calculated flow direction based on d8pointer")
+        emit_progress_func(user_id, project_name, task_type, 60, "Calculated flow direction based on d8pointer, now calculating flow accumulation")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -3217,7 +3751,7 @@ def watershed_delineation_point_only_gauging_st(work_directory_path,
                                 output=user_output_D8Flow_accum_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/Flow_accum_d8_DEM_UTM.tif',
                                 out_type="cells",log=False,clip=False,pntr=True,esri_pntr=False)
         print("Completed: calculated flow accumulation")
-        emit_progress_func(user_id, project_name, task_type, 65, "Generted flow accumulation raster")
+        emit_progress_func(user_id, project_name, task_type, 65, "Generted flow accumulation raster, now extracting streams")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -3237,7 +3771,7 @@ def watershed_delineation_point_only_gauging_st(work_directory_path,
                         output=stream_raster_temporary_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/Stream_raster_d8_DEM_UTM.tif',
                         threshold=flow_accum_threshold,zero_background=False)
         print("Completed: calculated stream raster")
-        emit_progress_func(user_id, project_name, task_type, 70, "Stream raster generated")
+        emit_progress_func(user_id, project_name, task_type, 70, "Stream raster generated, now extracting stream vector")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -3256,7 +3790,7 @@ def watershed_delineation_point_only_gauging_st(work_directory_path,
         wbt.raster_to_vector_lines(i=stream_raster_temporary_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/Stream_raster_d8_DEM_UTM.tif',
                             output=user_output_stream_vector_file_path)#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/Stream_vector_d8_DEM_UTM.shp')
         print(f"Completed: stream vector extracted")
-        emit_progress_func(user_id, project_name, task_type, 75, "Stream vector extracted")
+        emit_progress_func(user_id, project_name, task_type, 75, "Stream vector extracted, now finding road-stream intersections")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -3279,7 +3813,7 @@ def watershed_delineation_point_only_gauging_st(work_directory_path,
                                     ID_column=pour_ID,
                                     pour_point_snap_distance_m=pour_point_snap_distance_m)
         print("Completed: Road-stream crossings identified")
-        emit_progress_func(user_id, project_name, task_type, 80, "Road-stream crossings identified")
+        emit_progress_func(user_id, project_name, task_type, 80, "Road-stream crossings identified, now delineating watersheds")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -3295,15 +3829,31 @@ def watershed_delineation_point_only_gauging_st(work_directory_path,
     #_________________________________________________________________________________________________
     # Step17: delineate all watersheds based on pour point
     #_________________________________________________________________________________________________
+    # try:
+    #     delineate_watersheds_for_pour_points(user_output_D8flow_dir_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/Flow_dir_d8pointer_DEM_UTM.tif',
+    #                                     user_output_road_stream_intersect_vector_file_path,#  '/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/pour_points_snapped_to_rscs_UTM.shp',
+    #                                     ws_raster_temporary_file_path,#  '/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/all_watersheds_raster_UTM.tif',
+    #                                     ws_polygon_temporary_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/all_watersheds_polygon.shp',
+    #                                     user_output_all_ws_polygon_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/all_watersheds_polygon_with_pour_ID_UTM.shp',
+    #                                     ID_column=pour_ID)
     try:
-        delineate_watersheds_for_pour_points(user_output_D8flow_dir_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/Flow_dir_d8pointer_DEM_UTM.tif',
-                                        user_output_road_stream_intersect_vector_file_path,#  '/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/pour_points_snapped_to_rscs_UTM.shp',
-                                        ws_raster_temporary_file_path,#  '/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/all_watersheds_raster_UTM.tif',
-                                        ws_polygon_temporary_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/all_watersheds_polygon.shp',
-                                        user_output_all_ws_polygon_file_path,#'/content/drive/MyDrive/Santee_WS_deli/WS_delin_outputs/all_watersheds_polygon_with_pour_ID_UTM.shp',
-                                        ID_column=pour_ID)
+        nested_basins = nested_basin_delineation(
+        dem_path=user_output_breached_filled_DEM_file_path,
+        pour_points_path=user_output_road_stream_intersect_vector_file_path,  # Different for this function
+        flow_dir_path=user_output_D8flow_dir_file_path,
+        flow_accum_path=user_output_D8Flow_accum_file_path,
+        output_dir=user_temp_dir_path,
+        output_shapefile=user_output_all_ws_polygon_file_path,
+        snap_distance=pour_point_snap_distance_m,
+        ID_column=pour_ID,
+        emit_progress_func=emit_progress_func,  
+        user_id=user_id,                        
+        project_name=project_name,              
+        task_type=task_type,
+        check_cancellation_func=check_cancellation_func                     
+        )
         print("Completed: Watersheds delineated based on pour points")
-        emit_progress_func(user_id, project_name, task_type,87, "Watersheds delineated") 
+        emit_progress_func(user_id, project_name, task_type,87, "Watersheds delineated, now calculating average slope of watersheds") 
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -3324,7 +3874,7 @@ def watershed_delineation_point_only_gauging_st(work_directory_path,
                                         user_output_all_ws_polygon_file_path, 
                                         user_output_all_ws_polygon_file_path)
         print('avg slope calculated')
-        emit_progress_func(user_id, project_name, task_type,89, "Calculated avearge slope of watersheds") 
+        emit_progress_func(user_id, project_name, task_type,89, "Calculated avearge slope of watersheds, now calculating longest channel length") 
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -3337,7 +3887,7 @@ def watershed_delineation_point_only_gauging_st(work_directory_path,
     
     check_cancellation_func(user_id, project_name, task_type)
     #_________________________________________________________________________________________________
-    # Step20: calculating the mean slope for all waersheds
+    # Step20: calculating the longest channel path length for all waersheds
     #_________________________________________________________________________________________________
     try:
         calculate_longest_channel_path(user_output_breached_filled_DEM_file_path,
@@ -3346,7 +3896,7 @@ def watershed_delineation_point_only_gauging_st(work_directory_path,
                                     user_temp_dir_path,
                                     WS_ID='Point_ID')
         print('Longest channel length calculated')
-        emit_progress_func(user_id, project_name, task_type,92, "Longest channel length calculated")  
+        emit_progress_func(user_id, project_name, task_type,92, "Longest channel length calculated, now calculating maximum overland flow path length")  
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -3367,7 +3917,7 @@ def watershed_delineation_point_only_gauging_st(work_directory_path,
                                             user_output_all_ws_polygon_file_path,
                                             WS_ID='Point_ID')
         print('Maximum overland flow path length estimated')
-        emit_progress_func(user_id, project_name, task_type, 95, "Maximum overland flow path length estimated")
+        emit_progress_func(user_id, project_name, task_type, 95, "Maximum overland flow path length estimated, now calculating time of concentration")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -3387,7 +3937,7 @@ def watershed_delineation_point_only_gauging_st(work_directory_path,
         calculate_time_of_concentration(user_output_all_ws_polygon_file_path,
                                         user_output_all_ws_polygon_file_path)
         print('Time of concentration calculated')
-        emit_progress_func(user_id, project_name, task_type, 96, "Time of concentration calculated")
+        emit_progress_func(user_id, project_name, task_type, 96, "Time of concentration calculated, now filtering watersheds by drainage area")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -3411,7 +3961,7 @@ def watershed_delineation_point_only_gauging_st(work_directory_path,
                                     ID_column=pour_ID,
                                     min_area_ha=filter_Watershed_min_area_ha)
         print(f"Completed: watersheds and pour points filtered based on drianage area >={filter_Watershed_min_area_ha}")
-        emit_progress_func(user_id, project_name, task_type, 97, f"Kept watersheds with area >={filter_Watershed_min_area_ha}")
+        emit_progress_func(user_id, project_name, task_type, 97, f"Kept watersheds with area >={filter_Watershed_min_area_ha}, now flagging watersheds draining area outside boundary")
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -3438,7 +3988,7 @@ def watershed_delineation_point_only_gauging_st(work_directory_path,
                                                                                         pour_ID=pour_ID,
                                                                                         flag_area_ha=flag_wastershed_area_outside_boundary_ha)
         print(f'Completed: Flagged watersheds with ID: {[flag_ID]} that drain all or some area > {flag_wastershed_area_outside_boundary_ha} ha outside the main region boundary')
-        emit_progress_func(user_id, project_name, task_type, 98, f'Flagged watersheds that drain area located outside the AOI')
+        emit_progress_func(user_id, project_name, task_type, 98, f'Flagged watersheds that drain area located outside the AOI, now creating final interactive map')
     except TaskCancelledError:
         raise
     except Exception as e:
@@ -3457,7 +4007,7 @@ def watershed_delineation_point_only_gauging_st(work_directory_path,
         map = generate_basemap_results(work_directory_path,add_layer_control=True)
         map.save(user_output_final_watershed_html_map_path)
         print("Completed: Results saved in interactive map in html")
-        emit_progress_func(user_id, project_name, task_type, 5, "Results saved in interactive map in html")
+        emit_progress_func(user_id, project_name, task_type, 5, "Results saved in interactive map in html, preparing map to display")
     except TaskCancelledError:
         raise
     except Exception as e:

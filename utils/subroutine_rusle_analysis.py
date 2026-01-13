@@ -2459,7 +2459,7 @@ import rasterio
 from rasterio.warp import reproject, calculate_default_transform, Resampling
 
 def calculate_erosion_rate(r_factor_path, k_factor_path, ls_factor_path, c_factor_path, 
-                          output_path,  p_factor=1.0, resample_method='bilinear', chunk_size=1024, temp_dir = None):
+                          output_path,  p_factor, resample_method='bilinear', chunk_size=1024, temp_dir = None):
     """
     Calculate soil erosion rate using the rusle model by integrating all erosion factors.
     Using rasterio only to avoid GDAL array dependency issues.
@@ -3145,6 +3145,7 @@ def run_rusle_analysis(atlas14_dir_path,
                     ndvi_input_path,
                     aoi_NDVI_raster_output_path,
                     cfactor_raster_output_path,
+                    p_factor,
                     rusle_erosion_rate_raster_output_path,
                     watershed_polygon_shapefile_path,
                     categorized_risk_rusle_output_shapefile_path,
@@ -3313,7 +3314,7 @@ def run_rusle_analysis(atlas14_dir_path,
                                ls_factor_raster_output_path, 
                                cfactor_raster_output_path, 
                                rusle_erosion_rate_raster_output_path, 
-                               p_factor=1.0, 
+                               p_factor=p_factor, 
                                resample_method='bilinear',
                                chunk_size=4096,
                                temp_dir= temp_dir)

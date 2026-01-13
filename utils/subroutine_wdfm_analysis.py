@@ -337,6 +337,7 @@ def gssurgo_to_wdfm_rasters(gssurgo_soil_data_directory_path: str, boundary_shp_
     """
     Memory-efficient processing of GSSURGO soil data to WDFM categorized rasters,
     with correct handling for direct and inverse vulnerability scales.
+    Now saves both raw and categorized versions.
     """
     print("Starting optimized GSSURGO to WDFM rasters processing...")
     os.makedirs(output_dir, exist_ok=True)
@@ -380,10 +381,14 @@ def gssurgo_to_wdfm_rasters(gssurgo_soil_data_directory_path: str, boundary_shp_
             print(f"\nProcessing '{var_key}'")
             try:
                 source_raster_paths = [p for state in state_abbrs if os.path.exists(p := os.path.join(gssurgo_soil_data_directory_path, state.upper(), f'{var_key}.tif'))]
+                
+                # Define both raw and categorized output paths
+                raw_output_path = os.path.join(output_dir, f"raw_{var_key}_wdfm.tif")
                 final_output_path = os.path.join(output_dir, f"{var_key}_wdfm.tif")
                 
                 if not source_raster_paths:
-                    print(f"  No source rasters found, creating NaN raster.")
+                    print(f"  No source rasters found, creating NaN rasters.")
+                    create_nan_raster_from_template(template_path, raw_output_path)
                     create_nan_raster_from_template(template_path, final_output_path)
                     output_paths.append(final_output_path)
                     continue
@@ -393,16 +398,23 @@ def gssurgo_to_wdfm_rasters(gssurgo_soil_data_directory_path: str, boundary_shp_
                     vrt_path = os.path.join(local_temp_dir, f"{var_key}.vrt")
                     gdal.BuildVRT(vrt_path, source_raster_paths)
                     input_for_proc = vrt_path
-                    
-                processed_path = os.path.join(local_temp_dir, f"{var_key}_processed.tif")
+                
+                # Process to template and save as RAW version
+                print(f"  Saving raw clipped data to: raw_{var_key}_wdfm.tif")
                 process_raster_to_template(
-                    input_for_proc, processed_path, template_props, dissolved_boundary_path,
+                    input_for_proc, raw_output_path, template_props, dissolved_boundary_path,
                     resampling_method=Resampling.nearest, temp_dir=local_temp_dir, input_crs_override='EPSG:5070'
                 )
                 
-                with rasterio.open(processed_path) as src:
+                # Read raw data and categorize
+                with rasterio.open(raw_output_path) as src:
                     source_data = src.read(1)
-                    categorized_data = categorize_raster_data(source_data, config['type'], thresholds=config.get('thresholds'), mapping_dict=config.get('mapping_dict'))
+                    categorized_data = categorize_raster_data(
+                        source_data, 
+                        config['type'], 
+                        thresholds=config.get('thresholds'), 
+                        mapping_dict=config.get('mapping_dict')
+                    )
                     
                     # --- REVISED INVERSE LOGIC ---
                     # Check for the 'inverse' flag in the config dictionary.
@@ -417,8 +429,9 @@ def gssurgo_to_wdfm_rasters(gssurgo_soil_data_directory_path: str, boundary_shp_
                     meta.update(dtype='float32', nodata=np.nan)
                     with rasterio.open(final_output_path, 'w', **meta) as dst:
                         dst.write(categorized_data, 1)
-                        
-                print(f"  ✓ Success: {final_output_path}")
+                
+                print(f"  ✓ Raw data saved: {raw_output_path}")
+                print(f"  ✓ Categorized data saved: {final_output_path}")
                 output_paths.append(final_output_path)
             except Exception as e:
                 print(f"  ✗ Error processing '{var_key}': {str(e)}")
@@ -431,10 +444,14 @@ def gssurgo_to_wdfm_rasters(gssurgo_soil_data_directory_path: str, boundary_shp_
     finally:
         shutil.rmtree(local_temp_dir, ignore_errors=True)
 
+
 def process_geology_to_raster(geology_dir_path: str, boundary_shp_path: str,
                              dem_path: str, categorized_geology_path: str,
                              usa_states_shapefile_path: str, temp_dir: str = None) -> str:
-    """Memory-efficient processing of geology shapefile data to categorized raster."""
+    """
+    Memory-efficient processing of geology shapefile data to categorized raster.
+    Now saves both raw clipped shapefile (with text rock types) and categorized raster.
+    """
     print("Starting optimized geology processing...")
     local_temp_dir = tempfile.mkdtemp(dir=temp_dir)
     try:
@@ -442,6 +459,7 @@ def process_geology_to_raster(geology_dir_path: str, boundary_shp_path: str,
         create_dissolved_boundary_shapefile(boundary_shp_path, dissolved_boundary_path)
         template_path = os.path.join(local_temp_dir, "template_dem_geology.tif")
         template_props = create_template_from_boundary_and_dem(dissolved_boundary_path, dem_path, template_path)
+        
         geology_mapping = {
             'metasedimentary rock': 4, 'schist': 3, 'granitic gneiss': 2, 'gneiss': 3,
             'ultramafic intrusive rock': 1, 'biotite gneiss': 3, 'quartzite': 4, 'mica schist': 3,
@@ -452,41 +470,60 @@ def process_geology_to_raster(geology_dir_path: str, boundary_shp_path: str,
             'sand': 5, 'mafic gneiss': 3, 'alluvium': 4, 'clay or mud': 4, 'hornfels': 3,
             'charnockite': 4, 'dune sand': 5, 'unconsolidated deposit': 5, 'beach sand': 5, 'NODATA': np.nan
         }
+        
         state_abbrs = get_us_states_crossed(dissolved_boundary_path, usa_states_shapefile_path)
         if not state_abbrs:
             print("Warning: Could not determine states for boundary, creating NaN raster.")
             create_nan_raster_from_template(template_path, categorized_geology_path)
             return categorized_geology_path
+            
         geology_gdfs = [gpd.read_file(p) for state in state_abbrs if os.path.exists(p := os.path.join(geology_dir_path, state.upper(), f'geology_a_{state.lower()}.shp'))]
         if not geology_gdfs:
             print("Warning: No geology files found, creating NaN raster.")
             create_nan_raster_from_template(template_path, categorized_geology_path)
             return categorized_geology_path
+            
         geology_gdf = gpd.GeoDataFrame(pd.concat(geology_gdfs, ignore_index=True)).to_crs(template_props['crs'])
         boundary_gdf = gpd.read_file(dissolved_boundary_path).to_crs(template_props['crs'])
         clipped_geology = gpd.clip(geology_gdf, boundary_gdf)
+        
         if clipped_geology.empty:
             print("Warning: No geology data within boundary, creating NaN raster.")
             create_nan_raster_from_template(template_path, categorized_geology_path)
             return categorized_geology_path
+            
         geology_field = next((f for f in ['MAJOR1', 'ROCKTYPE1', 'UNIT_NAME'] if f.upper() in [c.upper() for c in clipped_geology.columns]), None)
         if not geology_field:
             raise ValueError("Could not find a valid geology field in the shapefile.")
+        
+        # Save RAW clipped geology shapefile (with original text rock types)
+        output_dir = os.path.dirname(categorized_geology_path)
+        raw_geology_shapefile = os.path.join(output_dir, "raw_geology_clipped.shp")
+        print(f"  Saving raw clipped geology shapefile to: raw_geology_clipped.shp")
+        clipped_geology.to_file(raw_geology_shapefile)
+        print(f"  ✓ Raw geology saved with {len(clipped_geology)} features and text rock types")
+        
+        # Now proceed with categorization
         geology_mapping_lower = {k.lower(): v for k, v in geology_mapping.items()}
         clipped_geology['geology_cat'] = clipped_geology[geology_field].str.lower().map(geology_mapping_lower)
         categorized_geology = clipped_geology.dropna(subset=['geology_cat'])
+        
         if categorized_geology.empty:
              print("Warning: No geology features could be categorized, creating NaN raster.")
              create_nan_raster_from_template(template_path, categorized_geology_path)
              return categorized_geology_path
+             
         temp_geology_shp = os.path.join(local_temp_dir, "temp_geo_cat.shp")
         categorized_geology[['geometry', 'geology_cat']].to_file(temp_geology_shp)
+        
         gdal.Rasterize(categorized_geology_path, temp_geology_shp,
                        format='GTiff', outputBounds=list(template_props['bounds']),
                        width=template_props['width'], height=template_props['height'],
                        noData=np.nan, outputSRS=template_props['crs'].to_wkt(),
                        attribute='geology_cat', allTouched=True,
                        creationOptions=['COMPRESS=LZW', 'TILED=YES'])
+        
+        print(f"  ✓ Categorized geology raster saved: {os.path.basename(categorized_geology_path)}")
         print("✓ Geology processing completed successfully!")
         return categorized_geology_path
     except Exception as e:
@@ -494,17 +531,28 @@ def process_geology_to_raster(geology_dir_path: str, boundary_shp_path: str,
     finally:
         shutil.rmtree(local_temp_dir, ignore_errors=True)
 
-# FIX: Refactored to use the robust `process_raster_to_template` and manual scaling.
+
 def process_and_categorize_ndvi_raster(ndvi_path: str, dem_path: str, boundary_path: str,
                                       output_path: str = None, ndvi_scale_factor: float = 10000.0,
                                       temp_dir: str = None) -> str:
-    """Memory-efficient and robust processing of NDVI raster with categorization."""
+    """
+    Memory-efficient and robust processing of NDVI raster with categorization.
+    Now saves both raw (scaled) and categorized versions.
+    """
     print("Starting optimized NDVI processing and categorization...")
     local_temp_dir = tempfile.mkdtemp(dir=temp_dir)
     try:
         if output_path is None:
             basename = os.path.splitext(os.path.basename(ndvi_path))[0]
             output_path = f"{basename}_categorized.tif"
+        
+        # Determine raw output path
+        output_dir = os.path.dirname(output_path)
+        basename = os.path.splitext(os.path.basename(output_path))[0]
+        # Remove '_categorized' suffix if present to create clean raw name
+        if basename.endswith('_categorized'):
+            basename = basename[:-len('_categorized')]
+        raw_output_path = os.path.join(output_dir, "raw_scaled_ndvi_UTM.tif")
         
         dissolved_boundary_path = os.path.join(local_temp_dir, "dissolved_boundary_ndvi.shp")
         create_dissolved_boundary_shapefile(boundary_path, dissolved_boundary_path)
@@ -518,8 +566,8 @@ def process_and_categorize_ndvi_raster(ndvi_path: str, dem_path: str, boundary_p
             resampling_method=Resampling.bilinear, temp_dir=local_temp_dir
         )
         
-        # Step 2: Read, scale, and categorize the warped data
-        print("Categorizing NDVI values...")
+        # Step 2: Read and scale the warped data
+        print("Scaling NDVI values...")
         with rasterio.open(processed_ndvi_path) as src:
             ndvi_data_int = src.read(1)
             meta = src.meta.copy()
@@ -528,16 +576,24 @@ def process_and_categorize_ndvi_raster(ndvi_path: str, dem_path: str, boundary_p
             ndvi_data_float = ndvi_data_int.astype('float32') / ndvi_scale_factor
             ndvi_data_float[np.isnan(ndvi_data_int)] = np.nan # Preserve NoData
             
-            # Categorize
+            # Save RAW scaled NDVI (before categorization)
+            print(f"  Saving raw scaled NDVI to: {raw_output_path}")
+            meta.update({'dtype': 'float32', 'nodata': np.nan})
+            with rasterio.open(raw_output_path, 'w', **meta) as dst:
+                dst.write(ndvi_data_float, 1)
+            
+            # Step 3: Categorize the scaled data
+            print("Categorizing NDVI values...")
             thresholds = [-0.6, -0.2, 0.2, 0.6] # 4 thresholds for 5 categories
             categorized_data = categorize_raster_data(ndvi_data_float, 'range', thresholds=thresholds)
             
             # Save the final categorized raster
-            meta.update({'dtype': 'float32', 'nodata': np.nan})
             with rasterio.open(output_path, 'w', **meta) as dst:
                 dst.write(categorized_data, 1)
 
-        print(f"✓ NDVI processing completed successfully: {output_path}")
+        print(f"  ✓ Raw scaled NDVI saved: {raw_output_path}")
+        print(f"  ✓ Categorized NDVI saved: {output_path}")
+        print(f"✓ NDVI processing completed successfully!")
         return output_path
     except Exception as e:
         traceback.print_exc()

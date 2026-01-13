@@ -408,7 +408,7 @@ def calculate_runoff_coefficient_from_table(ws_shapefile_path = '/content/drive/
                                             ):
     # Credible source for assigning NLCD values to Land Cover Types
     # https://www.hec.usace.army.mil/confluence/rasdocs/r2dum/6.0/developing-a-terrain-model-and-geospatial-layers/creating-land-cover-mannings-n-values-and-impervious-layers
-    # Credible source for Runoff Coefficient lookup table can be found here https://stormwater.pca.state.mn.us/index.php?title=Runoff_coefficients_for_different_soil_groups_and_slopes
+    # Credible source for Runoff Coefficient lookup table can be found here https://stormwater.pca.state.mn.us/runoff_coefficients_for_different_soil_groups_and_slopes
     os.makedirs(temp_folder_path, exist_ok=True)
     os.makedirs(output_folder, exist_ok=True)
 

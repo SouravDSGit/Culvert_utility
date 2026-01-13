@@ -5,6 +5,7 @@ from rpy2.robjects import pandas2ri
 import pandas as pd
 import geopandas as gpd
 import os
+import numpy as np
 
 
 
@@ -55,7 +56,7 @@ detect_and_remove_outliers <- function(data, column_name, method = c("Zscore","N
   }
   
   # Remove outliers while keeping structure intact
-  if (method != "Zscore" & method != "IQR") {
+  if (!(method %in% c("Zscore", "IQR"))) {
     data_cleaned <- data
   } else {
     data_cleaned <- data[!outliers, , drop = FALSE] 
@@ -155,25 +156,40 @@ single_site_freq_estimation <- function(cod_id,
     
     # Get parameters and return levels
     par = ci(best_model, type="parameter", alpha=sig_level, return.period=RP_list)
-    rl = ci(best_model, type="return.level", alpha=sig_level, return.period=RP_list)
+    
     
     if(best_model_idx == 1) {
       model_type = "Stationary"
       loc = par[1,2]
       scale = par[2,2]
       shape = if(Type == "GEV") par[3,2] else 1e-8
+      rl = ci(best_model, type="return.level", alpha=sig_level, return.period=RP_list)
     } else if(best_model_idx == 2) {
+      qcov_matrix=make.qcov(best_model,nr=nrow(dataframe))
       model_type = "Non-Stationary in location"
       loc = max(par[1,2] + par[2,2]*cov_data)
       scale = par[3,2]
       shape = if(Type == "GEV") par[4,2] else 1e-8
+      rl_list = lapply(RP_list, function(rp) {
+        rli = ci(best_model, type="return.level", alpha=sig_level, return.period=rp, qcov=qcov_matrix)
+        rli[nrow(rli), ]
+      })
+      rl = do.call(rbind, rl_list)
+      print(rl)
     } else {
+      qcov_matrix=make.qcov(best_model,nr=nrow(dataframe))
       model_type = "Non-Stationary in location and scale"
       mu = par[1,2] + par[2,2]*cov_data
       loc = max(mu)
       sigma = exp(par[3,2] + par[4,2]*cov_data)
       scale = sigma[which.max(mu)]
       shape = if(Type == "GEV") par[5,2] else 1e-8
+      rl_list = lapply(RP_list, function(rp) {
+        rli = ci(best_model, type="return.level", alpha=sig_level, return.period=rp, qcov=qcov_matrix)
+        rli[nrow(rli), ]
+      })
+      rl = do.call(rbind, rl_list)
+      print(rl)
     }
     
   } else {
@@ -444,19 +460,62 @@ main_regional_freq_analysis <- function(ts_dir_path,
     
     # print(df)
     
+    
     # Run function with specified method, column name, and optional Zscore threshold
     dataframe <- detect_and_remove_outliers(df, column_name = fit_data_column_Name, method = outlier_meth, z_threshold = z_threshold)
-    
+
     fit_data = dataframe[[fit_data_column_Name]]
-    
-    if(NS_logic==1){
-      cov_df = dataframe[[cov_data_column_name]]
-    }else{
-      cov_df='None'
+
+    # CRITICAL FIX: Handle covariate properly
+    if(NS_logic == 1) {
+      # Check if covariate exists and is valid
+      if(cov_data_column_name %in% colnames(dataframe)) {
+        cov_df = dataframe[[cov_data_column_name]]
+        
+        # Validate covariate length matches fit_data
+        if(length(cov_df) != length(fit_data)) {
+          warning(paste("Covariate length mismatch for site", site_name, 
+                      "- creating normalized sequential index"))
+          cov_df = NULL
+        }
+      } else {
+        cov_df = NULL
+      }
+      
+      # If covariate is invalid or missing, create normalized sequential index
+      if(is.null(cov_df)) {
+        # Use normalized sequential index (values in [-1, 1])
+        seq_index = seq_len(length(fit_data))
+        if(length(seq_index) > 1) {
+          cov_df = 2 * (seq_index - min(seq_index)) / (max(seq_index) - min(seq_index)) - 1
+        } else {
+          cov_df = 0  # Single observation
+        }
+        print(paste("Using normalized sequential index as covariate for", site_name))
+      } else {
+        # If covariate exists, ensure it's normalized
+        # Check if it looks like raw years (values > 100)
+        if(max(abs(cov_df), na.rm=TRUE) > 100) {
+          warning(paste("Covariate values too large for site", site_name, "- normalizing"))
+          cov_df = 2 * (cov_df - min(cov_df)) / (max(cov_df) - min(cov_df)) - 1
+        }
+      }
+    } else {
+      cov_df = 'None'
+    }
+
+    # Optional: Save the processed dataframe with covariate for debugging
+    if(NS_logic == 1 && !is.character(cov_df)) {
+      dataframe[[cov_data_column_name]] <- cov_df
+      write.csv(dataframe, file.path(ts_dir_path, paste0("processed_",var,"_", filename)), row.names=FALSE)
+      print(paste("Saved processed file with covariate for", site_name))
     }
     type_f = Type_of_dist
     
     cod_id = geodata[which(geodata$GWS_ID == site_name),]$Point_ID
+    if(length(cod_id) == 0) {
+      warning(paste("Site name", site_name, "not found in geodata."))
+    }
     FF[[f]]=single_site_freq_estimation(
       cod_id = cod_id,
       dataframe=dataframe,
@@ -469,6 +528,7 @@ main_regional_freq_analysis <- function(ts_dir_path,
       iter=iter,
       sig_level=sig_level
     )
+    
     ## Creating a dataframe for adding results of at-site frequency analysis
     site_df = data.frame(cod=cod_id,
                          site=site_name,sample_len=FF[[f]][[1]],  ### PATH TO FILE, AND SAMPLE LENGTH
@@ -536,251 +596,219 @@ main_regional_freq_analysis <- function(ts_dir_path,
     }
     write.csv(geodata, paste0(save_output_dir_path,"/PIDF_cmperhr_per_watershed_UTM_reprojected.csv"), row.names = FALSE)
     ## Save the workbook with all site's return values
-    saveWorkbook(wb, paste0(save_stats_output_dir_path,'/gauged_site_specific_return_values.xlsx'), overwrite = TRUE)
+    saveWorkbook(wb, paste0(save_stats_output_dir_path,'/',var,'_gauged_site_specific_return_values.xlsx'), overwrite = TRUE)
     ## Save the site specific statistics/results of at-site frequency analysis
-    write.csv(site_final, file = paste0(save_stats_output_dir_path,'/gauged_site_specific_stats.csv'), row.names = FALSE)
+    write.csv(site_final, file = paste0(save_stats_output_dir_path,'/',var,'_gauged_site_specific_stats.csv'), row.names = FALSE)
     
   }
-  
-  if(roi == 1 & var == 'stream' & length(gauging_st_names) >1 ){
-    
-    
-    roi_hom_gauged_file <- file.path(roi_hom_df_path, 'roi_hom_gauged.csv')
-    
-    if (file.exists(roi_hom_gauged_file)) {
-      g_hom_df <- read.csv(roi_hom_gauged_file)
-    } else {
-      print(paste("File does not exist:", roi_hom_gauged_file))
-    }
-    
-    col_gauged = colnames(g_hom_df)
-    for (colg in col_gauged){
-      homg_val <- as.list(na.omit(g_hom_df[[colg]]))
-      c_values <- which(sapply(FF, function(x) x$cod_id) %in% homg_val)
+  if(roi == 1 & var == 'stream' & length(gst_list_filenames) > 1){
+      # CASE: Multi-station stream WITH ROI regionalization
       
-      loc_list <- sapply(FF[c_values], function(x) x$Parameters["loc"])
-      scale_list = sapply(FF[c_values], function(x) x$Parameters["scale"])
-      shape_list = sapply(FF[c_values], function(x) x$Parameters["shape"])
-      shape_list[shape_list == 0] <- NaN # this is important before averaging, if some of the sites are fit to Gumbel dist.
-      sample_len_list <- sapply(FF[c_values], function(x) x$Sample_length)
-      weighted_avg_location <- weighted.mean(loc_list, sample_len_list)
-      weighted_avg_scale <- weighted.mean(scale_list, sample_len_list)
-      weighted_avg_shape <- weighted.mean(shape_list, sample_len_list, na.rm = TRUE)
+      roi_hom_gauged_file <- file.path(roi_hom_df_path, 'roi_hom_gauged.csv')
       
-      growth_curve =regional_growth_curve_estimation(weighted_avg_location,
-                                                     weighted_avg_scale,
-                                                     weighted_avg_shape,
-                                                     return_periods=RP_list,
-                                                     Method=Method, sig_level=sig_level, n_boot = n_boot)
-      gauged_point_id <- as.integer(gsub("^X", "", colg))
-      gauged_in <- which(geodata$Point_ID %in% gauged_point_id)
-      
-      for (gi in 1:length(RP_list)) {
-        # Generate the column names based on the Return Period
-        col_names <- c(paste0('RF', RP_list[gi], 'yrL'), 
-                       paste0('RF', RP_list[gi], 'yrE'), 
-                       paste0('RF', RP_list[gi], 'yrU'))
-        
-        # Extract the corresponding values from growth_curve for the given return period
-        values <- as.numeric(growth_curve[gi, 2:4])*as.numeric(geodata$Ind_val[gauged_in])*as.numeric(geodata$area_ha[gauged_in]/100)  # Lower_Quantile, Estimate, Upper_Quantile
-        
-        # Assign the values to all rows of the respective columns
-        geodata[gauged_in, col_names] <- matrix(rep(values, 1), ncol = 3, byrow = TRUE)
+      if (file.exists(roi_hom_gauged_file)) {
+        g_hom_df <- read.csv(roi_hom_gauged_file)
+      } else {
+        print(paste("File does not exist:", roi_hom_gauged_file))
       }
-    }
-    
-    roi_hom_file <- file.path(roi_hom_df_path, 'roi_hom.csv')
-    
-    if (file.exists(roi_hom_file)) {
-      hom_df <- read.csv(roi_hom_file)
-    } else {
-      print(paste("File does not exist:", roi_hom_file))
-    }
-    
-    # Function to check unique columns based on un-ordered values and assign unique IDs in the last row
-    assign_column_ids <- function(data) {
-      # Convert each column to a sorted character string (ignoring NA values) for comparison
-      column_patterns <- sapply(data, function(col) paste(sort(na.omit(col)), collapse = "-"))
-      # Find unique patterns and assign an ID for each unique column pattern
-      unique_patterns <- unique(column_patterns)
-      pattern_ids <- paste0("hom_reg", match(column_patterns, unique_patterns))
-      # Create a new row with these unique IDs
-      new_row <- pattern_ids
-      # Add the new row to the data frame
-      data <- rbind(data, new_row)
-      # Return the modified data frame
-      return(data)
-    }
-    
-    # Access dataframe by ID
-    hom_df_id <- assign_column_ids(hom_df)
-    
-    # Function to get unique columns based on the last row IDs
-    get_unique_columns <- function(df_with_ids) {
-      # Extract the unique ID row (last row) and transpose for easier manipulation
-      id_row <- as.character(df_with_ids[nrow(df_with_ids), ])
-      # Identify columns with unique ID values
-      unique_ids <- unique(id_row)
-      unique_columns <- df_with_ids[, !duplicated(id_row), drop = FALSE] # Use drop = FALSE to keep as dataframe
-      # Set the column names of the unique columns to match the unique ID values
-      colnames(unique_columns) <- unique_ids
-      # Remove the last row (ID row) from the output
-      unique_columns <- unique_columns[-nrow(unique_columns), , drop = FALSE]
-      return(unique_columns)
-    }
-    
-    # Get the unique columns as a new dataframe
-    unique_cods <- get_unique_columns(hom_df_id)
-    hom_reg = names(unique_cods)
-    print(paste0('number of homogeneous regions identified: ',length(hom_reg)))
-    list_gc = vector("list", length(hom_reg))
-    for(gc in 1:length(hom_reg)){
-      hom_cod = as.numeric(na.omit(unique_cods[[hom_reg[gc]]]))
-      indices <- which(site_final$cod %in% hom_cod)
-      loc_list = site_final$loc[indices]
-      scale_list = site_final$scale[indices]
-      shape_list = site_final$shape[indices]
-      shape_list[shape_list == 0] <- NaN # this is important before averaging, if some of the sites are fit to Gumbel dist.
-      sample_len_list = site_final$sample_len[indices]
-      weighted_avg_location <- weighted.mean(loc_list, sample_len_list)
-      weighted_avg_scale <- weighted.mean(scale_list, sample_len_list)
-      weighted_avg_shape <- weighted.mean(shape_list, sample_len_list, na.rm = TRUE)
-      print(paste0('Status: deriving growth curve for ',hom_reg[gc]))
-      list_gc[[gc]]<- list(region_id = hom_reg[gc],
-                           growth_curve =regional_growth_curve_estimation(weighted_avg_location,
-                                                                          weighted_avg_scale,
-                                                                          weighted_avg_shape,
-                                                                          return_periods=RP_list,
-                                                                          Method=Method, sig_level=sig_level, n_boot = n_boot))
       
-    }
-    print("Growth curve estimated")
-    ## Calculating the return values for the ungauged catchment from the growth curve and the index flood of the ROI
-    roi_index_file <- file.path(roi_df_path, 'roi_index.csv')
-    
-    if (file.exists(roi_index_file)) {
-      ung_roi_df <- read.csv(roi_index_file)
-    } else {
-      print(paste("File does not exist:", roi_index_file))
-    }
-    
-    ung_roi_df = rbind(ung_roi_df,hom_df_id[nrow(hom_df_id),])
-    # Extract non-matching GWS_IDs
-    non_matching_gsts <- na.omit(geodata$GWS_ID[!is.na(geodata$GWS_ID) & !(geodata$GWS_ID %in% gauging_st_names)])
-    print(non_matching_gsts)
-    # Filter the data to include both conditions
-    ung_df <- geodata[geodata$Flag_Gst == 0 | geodata$GWS_ID %in% non_matching_gsts, ]
-    for(un in 1:nrow(ung_df)){
-      ung_cod = ung_df$Point_ID[un]
-      ung_cod_ID=paste0('X',ung_cod)
-      ung_hom_reg_id = ung_roi_df[[ung_cod_ID]][nrow(ung_roi_df)]
-      # Define the target homogeneous region ID you want to retrieve
-      target_region_id <- ung_hom_reg_id  # Replace with the desired region ID
-      
-      # Find the growth curve for the specified homogeneous region ID
-      growth_curve <- NULL
-      for (entry in list_gc) {
-        if (entry$region_id == target_region_id) {
-          growth_curve <- entry$growth_curve
-          break  # Stop the loop once the target region is found
+      col_gauged = colnames(g_hom_df)
+      for (colg in col_gauged){
+        homg_val <- as.list(na.omit(g_hom_df[[colg]]))
+        c_values <- which(sapply(FF, function(x) x$cod_id) %in% homg_val)
+        
+        loc_list <- sapply(FF[c_values], function(x) x$Parameters["loc"])
+        scale_list = sapply(FF[c_values], function(x) x$Parameters["scale"])
+        shape_list = sapply(FF[c_values], function(x) x$Parameters["shape"])
+        shape_list[shape_list == 0] <- NaN
+        sample_len_list <- sapply(FF[c_values], function(x) x$Sample_length)
+        weighted_avg_location <- weighted.mean(loc_list, sample_len_list)
+        weighted_avg_scale <- weighted.mean(scale_list, sample_len_list)
+        weighted_avg_shape <- weighted.mean(shape_list, sample_len_list, na.rm = TRUE)
+        
+        growth_curve =regional_growth_curve_estimation(weighted_avg_location,
+                                                      weighted_avg_scale,
+                                                      weighted_avg_shape,
+                                                      return_periods=RP_list,
+                                                      Method=Method, sig_level=sig_level, n_boot = n_boot)
+        gauged_point_id <- as.integer(gsub("^X", "", colg))
+        gauged_in <- which(geodata$Point_ID %in% gauged_point_id)
+        
+        for (gi in 1:length(RP_list)) {
+          col_names <- c(paste0('RF', RP_list[gi], 'yrL'), 
+                        paste0('RF', RP_list[gi], 'yrE'), 
+                        paste0('RF', RP_list[gi], 'yrU'))
+          
+          values <- as.numeric(growth_curve[gi, 2:4])*as.numeric(geodata$Ind_val[gauged_in])*as.numeric(geodata$area_ha[gauged_in]/100)
+          
+          geodata[gauged_in, col_names] <- matrix(rep(values, 1), ncol = 3, byrow = TRUE)
         }
       }
       
-      roi_cod = as.numeric(na.omit(ung_roi_df[[ung_cod_ID]]))[1]
-      ung_index = site_final$index_flood[which(site_final$cod %in% roi_cod)]
-      ind = which(geodata$Point_ID == ung_cod)
-      geodata$Ind_val[ind] <- as.numeric(ung_index)
-      ung_RV= growth_curve[,2:4]*as.numeric(ung_index)*as.numeric(geodata$area_ha[ind]/100)
+      roi_hom_file <- file.path(roi_hom_df_path, 'roi_hom.csv')
       
-      for (gi in 1:length(RP_list)) {
-        # Generate column names dynamically for RF values
-        col_names <- c(paste0('RF', RP_list[gi], 'yrL'), 
-                       paste0('RF', RP_list[gi], 'yrE'), 
-                       paste0('RF', RP_list[gi], 'yrU'))
-        
-        # Extract the corresponding values from ung_RV for the given return period
-        values <- as.numeric(ung_RV[gi, 1:3])  # Lower_Quantile, Estimate, Upper_Quantile
-        
-        # Find the rows where Point_ID matches ung_cod
-        rows_to_update <- which(geodata$Point_ID == ung_cod)
-        
-        # Assign values to the selected rows
-        geodata[rows_to_update, col_names] <- matrix(rep(values, length(rows_to_update)), 
-                                                     ncol = 3, byrow = TRUE)
+      if (file.exists(roi_hom_file)) {
+        hom_df <- read.csv(roi_hom_file)
+      } else {
+        print(paste("File does not exist:", roi_hom_file))
       }
       
-    }
-    # Create a new workbook
-    wb_gc <- createWorkbook()
-    
-    # Loop through each item in list_gc to add sheets
-    for (entry in list_gc) {
-      # Extract region ID and growth curve data
-      region_id <- entry$region_id
-      growth_curve <- entry$growth_curve
+      assign_column_ids <- function(data) {
+        column_patterns <- sapply(data, function(col) paste(sort(na.omit(col)), collapse = "-"))
+        unique_patterns <- unique(column_patterns)
+        pattern_ids <- paste0("hom_reg", match(column_patterns, unique_patterns))
+        new_row <- pattern_ids
+        data <- rbind(data, new_row)
+        return(data)
+      }
       
-      # Add a new sheet named after the region_id
-      addWorksheet(wb_gc, sheetName = region_id)
+      hom_df_id <- assign_column_ids(hom_df)
       
-      # Write the growth curve data to the sheet
-      writeData(wb_gc, sheet = region_id, growth_curve)
-    }
-    
-    # Saving the homogeneous region : gauged cod and region ID for each ungauged catchment
-    write.csv(hom_df_id, file = paste0(save_stats_output_dir_path,'/ungauged_site_hom_region_ID_with_ROI.csv'), row.names = FALSE)
-    print("saved the hom region gauged cod and region ID for each ungauged catchments as ungauged_site_hom_region_ID_with_ROI.csv")
-    # Saving the workbook as an Excel file
-    saveWorkbook(wb_gc, paste0(save_stats_output_dir_path,"/growth_curves_by_hom_region.xlsx"), overwrite = TRUE)
-    print("Excel file 'growth_curves_by_hom_region.xlsx' has been saved with each growth curve quantile in a separate sheet.")
-    # Saving the final results with Return values in a geodataframe
-    write.csv(geodata, paste0(save_output_dir_path,"/RFA_results_of_return_values.csv"), row.names = FALSE)
-    print("Saving the final results with Return values as RFA_results_of_return_values.csv")
-    
-  }else{
-    if (var =='stream' & length(gst_list_filenames)==1){
+      get_unique_columns <- function(df_with_ids) {
+        id_row <- as.character(df_with_ids[nrow(df_with_ids), ])
+        unique_ids <- unique(id_row)
+        unique_columns <- df_with_ids[, !duplicated(id_row), drop = FALSE]
+        colnames(unique_columns) <- unique_ids
+        unique_columns <- unique_columns[-nrow(unique_columns), , drop = FALSE]
+        return(unique_columns)
+      }
+      
+      unique_cods <- get_unique_columns(hom_df_id)
+      hom_reg = names(unique_cods)
+      print(paste0('number of homogeneous regions identified: ',length(hom_reg)))
+      list_gc = vector("list", length(hom_reg))
+      for(gc in 1:length(hom_reg)){
+        hom_cod = as.numeric(na.omit(unique_cods[[hom_reg[gc]]]))
+        indices <- which(site_final$cod %in% hom_cod)
+        loc_list = site_final$loc[indices]
+        scale_list = site_final$scale[indices]
+        shape_list = site_final$shape[indices]
+        shape_list[shape_list == 0] <- NaN
+        sample_len_list = site_final$sample_len[indices]
+        weighted_avg_location <- weighted.mean(loc_list, sample_len_list)
+        weighted_avg_scale <- weighted.mean(scale_list, sample_len_list)
+        weighted_avg_shape <- weighted.mean(shape_list, sample_len_list, na.rm = TRUE)
+        print(paste0('Status: deriving growth curve for ',hom_reg[gc]))
+        list_gc[[gc]]<- list(region_id = hom_reg[gc],
+                            growth_curve =regional_growth_curve_estimation(weighted_avg_location,
+                                                                            weighted_avg_scale,
+                                                                            weighted_avg_shape,
+                                                                            return_periods=RP_list,
+                                                                            Method=Method, sig_level=sig_level, n_boot = n_boot))
+        
+      }
+      print("Growth curve estimated")
+      
+      roi_index_file <- file.path(roi_df_path, 'roi_index.csv')
+      
+      if (file.exists(roi_index_file)) {
+        ung_roi_df <- read.csv(roi_index_file)
+      } else {
+        print(paste("File does not exist:", roi_index_file))
+      }
+      
+      ung_roi_df = rbind(ung_roi_df,hom_df_id[nrow(hom_df_id),])
+      non_matching_gsts <- na.omit(geodata$GWS_ID[!is.na(geodata$GWS_ID) & !(geodata$GWS_ID %in% gauging_st_names)])
+      print(non_matching_gsts)
+      ung_df <- geodata[geodata$Flag_Gst == 0 | geodata$GWS_ID %in% non_matching_gsts, ]
+      for(un in 1:nrow(ung_df)){
+        ung_cod = ung_df$Point_ID[un]
+        ung_cod_ID=paste0('X',ung_cod)
+        ung_hom_reg_id = ung_roi_df[[ung_cod_ID]][nrow(ung_roi_df)]
+        target_region_id <- ung_hom_reg_id
+        
+        growth_curve <- NULL
+        for (entry in list_gc) {
+          if (entry$region_id == target_region_id) {
+            growth_curve <- entry$growth_curve
+            break
+          }
+        }
+        
+        roi_cod = as.numeric(na.omit(ung_roi_df[[ung_cod_ID]]))[1]
+        ung_index = site_final$index_flood[which(site_final$cod %in% roi_cod)]
+        ind = which(geodata$Point_ID == ung_cod)
+        geodata$Ind_val[ind] <- as.numeric(ung_index)
+        ung_RV= growth_curve[,2:4]*as.numeric(ung_index)*as.numeric(geodata$area_ha[ind]/100)
+        
+        for (gi in 1:length(RP_list)) {
+          col_names <- c(paste0('RF', RP_list[gi], 'yrL'), 
+                        paste0('RF', RP_list[gi], 'yrE'), 
+                        paste0('RF', RP_list[gi], 'yrU'))
+          
+          values <- as.numeric(ung_RV[gi, 1:3])
+          
+          rows_to_update <- which(geodata$Point_ID == ung_cod)
+          
+          geodata[rows_to_update, col_names] <- matrix(rep(values, length(rows_to_update)), 
+                                                      ncol = 3, byrow = TRUE)
+        }
+        
+      }
+      
+      wb_gc <- createWorkbook()
+      
+      for (entry in list_gc) {
+        region_id <- entry$region_id
+        growth_curve <- entry$growth_curve
+        
+        addWorksheet(wb_gc, sheetName = region_id)
+        
+        writeData(wb_gc, sheet = region_id, growth_curve)
+      }
+      
+      saveWorkbook(wb, paste0(save_stats_output_dir_path,'/',var,'_gauged_site_specific_return_values.xlsx'), overwrite = TRUE)
+      write.csv(site_final, file = paste0(save_stats_output_dir_path,'/',var,'_gauged_site_specific_stats.csv'), row.names = FALSE)
+      
+      write.csv(hom_df_id, file = paste0(save_stats_output_dir_path,'/',var,'_ungauged_site_hom_region_ID_with_ROI.csv'), row.names = FALSE)
+      print(paste0("saved the hom region gauged cod and region ID for each ungauged catchments as ",var,"_ungauged_site_hom_region_ID_with_ROI.csv"))
+      
+      saveWorkbook(wb_gc, paste0(save_stats_output_dir_path,"/",var,"_growth_curves_by_hom_region.xlsx"), overwrite = TRUE)
+      print(paste0("Excel file '",var,"_growth_curves_by_hom_region.xlsx' has been saved with each growth curve quantile in a separate sheet."))
+      
+      write.csv(geodata, paste0(save_output_dir_path,"/RFA_results_of_return_values.csv"), row.names = FALSE)
+      print("Saving the final results with Return values as RFA_results_of_return_values.csv")
+      
+    } else if (var == 'stream') {
+      # CASE: Single-station OR Multi-station WITHOUT ROI (simple pooling)
       
       loc_list = site_final$loc
       scale_list = site_final$scale
       shape_list = site_final$shape
-      shape_list[shape_list == 0] <- NaN # this is important before averaging, if some of the sites are fit to Gumbel dist.
+      shape_list[shape_list == 0] <- NaN
       sample_len_list = site_final$sample_len
       weighted_avg_location <- weighted.mean(loc_list, sample_len_list)
       weighted_avg_scale <- weighted.mean(scale_list, sample_len_list)
       weighted_avg_shape <- weighted.mean(shape_list, sample_len_list, na.rm = TRUE)
       
-      growth_curve =regional_growth_curve_estimation(weighted_avg_location,
-                                                     weighted_avg_scale,
-                                                     weighted_avg_shape,
-                                                     return_periods=RP_list,
-                                                     Method=Method, sig_level=sig_level, n_boot = n_boot)
+      growth_curve = regional_growth_curve_estimation(weighted_avg_location,
+                                                      weighted_avg_scale,
+                                                      weighted_avg_shape,
+                                                      return_periods=RP_list,
+                                                      Method=Method, sig_level=sig_level, n_boot = n_boot)
       
       for (gi in 1:length(RP_list)) {
-        # Generate the column names based on the Return Period
         col_names <- c(paste0('RF', RP_list[gi], 'yrL'), 
-                       paste0('RF', RP_list[gi], 'yrE'), 
-                       paste0('RF', RP_list[gi], 'yrU'))
+                      paste0('RF', RP_list[gi], 'yrE'), 
+                      paste0('RF', RP_list[gi], 'yrU'))
         
-        # Extract the corresponding values from growth_curve for the given return period
-        gc_values <- as.numeric(growth_curve[gi, 2:4])  # Lower_Quantile, Estimate, Upper_Quantile
+        gc_values <- as.numeric(growth_curve[gi, 2:4])
         index_val = site_final$index_flood
-        area_val = as.numeric(geodata$area_ha[which(geodata$GWS_ID ==gauging_st_names)]/100) # in km2
-        # Assign the values to all rows of the respective columns
+        area_val = as.numeric(geodata$area_ha/100)
         geodata[, col_names] <- matrix(rep(gc_values, nrow(geodata)), ncol = 3, byrow = TRUE)*as.numeric(index_val)*area_val
       }
-      ## Save the workbook with all site's return values
-      saveWorkbook(wb, paste0(save_stats_output_dir_path,'/gauged_site_specific_return_values.xlsx'), overwrite = TRUE)
-      ## Save the site specific statistics/results of at-site frequency analysis
-      write.csv(site_final, file = paste0(save_stats_output_dir_path,'/gauged_site_specific_stats.csv'), row.names = FALSE)
+      
+      saveWorkbook(wb, paste0(save_stats_output_dir_path,'/',var,'_gauged_site_specific_return_values.xlsx'), overwrite = TRUE)
+      write.csv(site_final, file = paste0(save_stats_output_dir_path,'/',var,'_gauged_site_specific_stats.csv'), row.names = FALSE)
       
       write.csv(geodata, paste0(save_output_dir_path,"/RFA_results_of_return_values.csv"), row.names = FALSE)
       print("Saving the final results with Return values as RFA_results_of_return_values.csv")
     }
-    
-  }
 }
 
 """
 )
+
 
 
 
@@ -794,7 +822,7 @@ def with_r_context(func):
 
 @with_r_context
 def main_regional_freq_analysis(ts_dir_path,
-                                data_polygon_shapefile_path,  # Still accept shapefile path
+                                data_polygon_shapefile_path,
                                 fit_data_column_Name,
                                 save_stats_output_dir_path,
                                 save_output_dir_path,
@@ -833,7 +861,7 @@ def main_regional_freq_analysis(ts_dir_path,
             f"""
             main_regional_freq_analysis(
                 ts_dir_path = '{ts_dir_path}',
-                data_polygon_csv_path = '{csv_path}',  # Use CSV instead
+                data_polygon_csv_path = '{csv_path}',
                 fit_data_column_Name = '{fit_data_column_Name}',
                 save_stats_output_dir_path = '{save_stats_output_dir_path}',
                 save_output_dir_path = '{save_output_dir_path}',
@@ -871,23 +899,7 @@ def main_regional_freq_analysis(ts_dir_path,
             # Read results and merge with original geometry
             result_df = pd.read_csv(result_csv)
             
-            # Merge results with original geodataframe geometry
-            # Assuming there's a common ID column to join on
-            # Merge results with original geodataframe geometry
-            common_cols = list(set(gdf.columns).intersection(set(result_df.columns)))
-            if 'geometry' in common_cols:
-                common_cols.remove('geometry')
-
-            if common_cols:
-                # Use the first common column as merge key
-                merge_key = common_cols[0]
-                result_gdf = gdf.merge(result_df, on=merge_key, how='left', suffixes=('', '_r'))
-            else:
-                # If no common columns, assume same order and concatenate
-                result_gdf = gdf.copy()
-                for col in result_df.columns:
-                    if col not in result_gdf.columns:
-                        result_gdf[col] = result_df[col].values
+            result_gdf = gdf.merge(result_df, on="Point_ID", how='left', suffixes=('', '_r'))
             
             # Save as shapefile using GeoPandas
             if var == 'precip':
