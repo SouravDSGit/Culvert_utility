@@ -24,7 +24,7 @@ These utilities enable engineers and researchers to assess the hydrologic and ge
 
 ### 🗺️ Watershed Analysis
 
-- **Sub-meter resolution** watershed delineation for up to 120,000 Ha and upto 300 pour points
+- **Sub-meter resolution** watershed delineation for up to 120,000 Ha drainage area and upto 300 pour points
 - Automated watershed boundary generation tailored to culvert locations
 - Stream network extraction and analysis
 
