@@ -38,9 +38,9 @@ These utilities enable engineers and researchers to assess the hydrologic and ge
 
 ### 🏔️ Hydro-Geomorphologic Risk Analysis
 
-- **RUSLE** (Revised Universal Soil Loss Equation) erosion rate calculations
-- **SBEVA** Stream bank erosion vulnerability modeling
-- **WDFM** Watershed debris flow model
+- **RUSLE:** Revised Universal Soil Loss Equation for erosion rate calculations
+- **SBEVA:** Stream bank erosion vulnerability modeling
+- **WDFM:** Watershed debris flow model
 
 ### 📊 Visualization and Reporting
 
