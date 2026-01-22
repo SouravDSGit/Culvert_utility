@@ -71,6 +71,7 @@ These utilities are part of the **CULVERT Tool** web application, which provides
 - 🔌 Integration with open source quality data sources
 
 **Visit the main application at:** [https://culvert-at-risk.org](https://culvert-at-risk.org)
+
 **Donwload the Software Manual here:** [https://culvert-at-risk.org/static/manual/manual.pdf](https://culvert-at-risk.org/static/manual/manual.pdf)
 
 ---
