@@ -25,8 +25,9 @@ These utilities enable engineers and researchers to assess the hydrologic and ge
 ### 🗺️ Watershed Analysis
 
 - **Sub-meter resolution** watershed delineation for up to 120,000 Ha drainage area and upto 300 pour points
-- Automated watershed boundary generation tailored to culvert locations
+- Automated watershed boundary generation tailored to culvert locations and with hydro-enforcement respecting road infrastructure
 - Stream network extraction and analysis
+- Works even without pour point data
 
 ### 💧 Hydrologic Vulnerability Assessment
 
