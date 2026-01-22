@@ -33,14 +33,14 @@ These utilities enable engineers and researchers to assess the hydrologic and ge
 - Rational method implementation for peak discharge estimation
 - Graphical peak discharge methods
 - Non-stationary regional frequency analysis
-- Culvert capacity calculations for inlet and outlet control conditions
+- Culvert capacity calculations for FHWA's inlet and outlet control, and open channel flow conditions
 - Return period flood analysis
 
 ### 🏔️ Hydro-Geomorphologic Risk Analysis
 
 - **RUSLE** (Revised Universal Soil Loss Equation) erosion rate calculations
-- Stream bank erosion vulnerability modeling
-- Watershed debris flow model
+- **SBEVA** Stream bank erosion vulnerability modeling
+- **WDFM** Watershed debris flow model
 
 ### 📊 Visualization and Reporting
 
@@ -56,7 +56,6 @@ These utilities enable engineers and researchers to assess the hydrologic and ge
 | Feature                      | Description                                                              |
 | ---------------------------- | ------------------------------------------------------------------------ |
 | **🧩 Modular Design**        | Independent utility functions that can be used separately or together    |
-| **📏 Standards-Based**       | Calculations follow FHWA, USDA, and USGS methodologies                   |
 | **🌍 Geospatial Processing** | Built-in support for raster and vector data handling                     |
 | **⚡ Scalable**              | Designed to handle multiple pour points and large watersheds efficiently |
 
@@ -66,7 +65,7 @@ These utilities enable engineers and researchers to assess the hydrologic and ge
 
 These utilities are part of the **CULVERT Tool** web application, which provides:
 
-- 🖥️ Interactive web interface for vulnerability assessments
+- 🖥️ Interactive web interface for dynamic vulnerability assessments
 - 📁 Project management and data persistence
 - 📄 Comprehensive technical report generation
 - 🔌 Integration with open source quality data sources
@@ -79,13 +78,7 @@ These utilities are part of the **CULVERT Tool** web application, which provides
 
 For questions, bug reports, or feedback:
 
-- 📧 **Email:** support@culvert-at-risk.org
+- 📧 **Email:** support@culvert-at-risk.org; soumukhcivil@gmail.com; devendra.m.amatya@usda.gov
 - 🌐 **Project website:** [https://culvert-at-risk.org](https://culvert-at-risk.org)
 
 ---
-
-<div align="center">
-
-**Made with 🌊 for climate resilience and infrastructure safety**
-
-</div>
