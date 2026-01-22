@@ -1016,7 +1016,7 @@ def Calculate_peakQ_using_RM_from_NOAA_Atlas(crunoff_shapefile_dir_path,
           return closest_duration_match, closest_duration_min
 
         ############################################################################################
-        ###### Function to calculate the area reduction factor for area > 400Ha
+        ###### Function to calculate the area reduction factor for area follwoing Bell, 1976 https://nora.nerc.ac.uk/id/eprint/5751/ 
         ############################################################################################
         def calculate_ARF(dur, area_ha):
           ARF = 1 - np.exp(-1.1*float(dur)**0.25) + np.exp(-1.1*float(dur)**0.25 - 2.59*10**-2*float(area_ha)*0.01)
@@ -1090,17 +1090,11 @@ def Calculate_peakQ_using_RM_from_NOAA_Atlas(crunoff_shapefile_dir_path,
                   pidf[f'PIevent'] = [float(pointPI) * 2.54]  # converting from inch/hr to cm/hr
                   Correction_factor = 1.0  # No correction factor for pointPI
                 
-              if row['area_ha'] <= 400:
-                  rvdf=rvdf               ## unit is in/hr which is used in Q = CIA
-                  pidf=pidf*2.54 if pointPI is None else pidf          ## converting from inch/hr to cm/hr
-              elif 400 < row['area_ha'] < 110000:
-                  ARF = calculate_ARF(closest_duration_min/60, row['area_ha'])
-                  rvdf = rvdf * ARF       ## areal estimate but unit is still in/hr, which is used in Q = CIA
-                  pidf = pidf * ARF*2.54 if pointPI is None else pidf * ARF  ## areal estimate and then converting from inch/hr to cm/hr
-              else:
-                  rvdf = np.nan
-                  pidf = np.nan
-                  print(f'NaN values inserted for watershed area greater than 110000 Ha')
+              
+              ARF = calculate_ARF(closest_duration_min/60, row['area_ha'])
+              rvdf = rvdf * ARF       ## areal estimate but unit is still in/hr, which is used in Q = CIA
+              pidf = pidf * ARF*2.54 if pointPI is None else pidf * ARF  ## areal estimate and then converting from inch/hr to cm/hr
+              
               area=row['area_ha']*2.47105 # converting from ha to acre 
               Crunoff=row['C_Runoff']
               # Append rvdf to rv_df with the index of the current row
