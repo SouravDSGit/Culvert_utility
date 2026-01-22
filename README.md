@@ -35,6 +35,7 @@ These utilities enable engineers and researchers to assess the hydrologic and ge
 - Non-stationary regional frequency analysis
 - Culvert capacity calculations for FHWA's inlet and outlet control, and open channel flow conditions
 - Return period flood analysis
+- Hurricane induced rainfall event based analysis
 
 ### 🏔️ Hydro-Geomorphologic Risk Analysis
 
